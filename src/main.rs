@@ -33,8 +33,12 @@ fn main() {
             }
             tun::run()
         }
+        "vpn-server" => server::run_vpn(&require_address(program, &args, mode)),
+        "vpn-client" => client::run_vpn(&require_address(program, &args, mode)),
         other => {
-            eprintln!("Unknown mode '{other}'. Expected 'server', 'client', or 'tun'.");
+            eprintln!(
+                "Unknown mode '{other}'. Expected 'server', 'client', 'tun', 'vpn-server', or 'vpn-client'."
+            );
             print_usage(program);
             process::exit(1);
         }
@@ -60,7 +64,9 @@ fn require_address(program: &str, args: &[String], mode: &str) -> String {
 
 fn print_usage(program: &str) {
     eprintln!("Usage:");
-    eprintln!("  {program} server <address>");
-    eprintln!("  {program} client <address>");
-    eprintln!("  {program} tun");
+    eprintln!("  {program} server <address>       (v0.1: raw TCP byte tunnel server)");
+    eprintln!("  {program} client <address>       (v0.1: raw TCP byte tunnel client)");
+    eprintln!("  {program} tun                    (v0.2: standalone TUN packet dump)");
+    eprintln!("  {program} vpn-server <address>   (v0.3: TUN <-> TCP server)");
+    eprintln!("  {program} vpn-client <address>   (v0.3: TUN <-> TCP client)");
 }

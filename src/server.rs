@@ -1,14 +1,18 @@
-//! TCP byte-tunnel server (v0.1).
+//! TCP byte-tunnel server (v0.1) and VPN server (v0.3).
 //!
-//! Accepts one client connection at a time and relays raw bytes between
-//! the tunnel and the client itself: whatever the client sends is relayed
-//! back over the same TCP connection. There is no second endpoint yet in
-//! v0.1, so this is the simplest possible "forward bytes between
-//! endpoints" behavior, and it doubles as an end-to-end smoke test for the
-//! tunnel plumbing that later versions will build on.
+//! `run()` is the original v0.1 mode: it accepts one client connection at
+//! a time and relays raw bytes between the tunnel and the client itself,
+//! since there's no second endpoint yet in v0.1.
+//!
+//! `run_vpn()` is new in v0.3: it accepts one client, creates a TUN
+//! interface, and relays raw IP packets between the TUN device and the
+//! TCP connection, in both directions, concurrently.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+use crate::tun;
 
 /// Bind to `address` and serve one client connection at a time, forever.
 pub fn run(address: &str) -> io::Result<()> {
@@ -45,4 +49,51 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
         }
         stream.write_all(&buf[..n])?;
     }
+}
+
+/// Listen on `address`, accept a single VPN client, create the server TUN
+/// interface, and relay raw IP packets between the TUN device and the TCP
+/// connection in both directions, concurrently.
+///
+/// See `tun::relay_tun_to_writer` / `tun::relay_reader_to_tun` for the
+/// important caveat that v0.3 does not yet frame packets on the wire.
+pub fn run_vpn(address: &str) -> io::Result<()> {
+    let listener = TcpListener::bind(address)?;
+    println!("VPN server listening on {address}");
+
+    let (stream, peer) = listener.accept()?;
+    println!("Client connected: {peer}");
+
+    let tun_device = tun::create_device(
+        tun::SERVER_TUN_NAME,
+        tun::SERVER_TUN_ADDRESS,
+        tun::VPN_TUN_NETMASK,
+    )?;
+    let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
+    println!(
+        "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
+        tun::SERVER_TUN_NAME
+    );
+
+    let (tun_reader, tun_writer) = tun_device.split();
+    let tcp_upload = stream.try_clone()?;
+    let tcp_download = stream;
+
+    // Thread: TUN -> TCP (packets captured from the server's TUN device
+    // are sent to the client).
+    let upload_thread = thread::spawn(move || {
+        tun::relay_tun_to_writer(tun_reader, tcp_upload, "Server")
+    });
+
+    // Main thread: TCP -> TUN (packets arriving from the client are
+    // written into the server's TUN device).
+    let download_result = tun::relay_reader_to_tun(tcp_download, tun_writer, "Server");
+
+    match upload_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Server TUN->TCP error: {e}"),
+        Err(_) => eprintln!("Server TUN->TCP thread panicked"),
+    }
+
+    download_result
 }
