@@ -1,0 +1,8 @@
+# Placeholder client config file.
+#
+# Not read by tiny-vpn yet -- config-file loading is not part of v0.1 or
+# v0.2. This file exists so the intended config format has a home once
+# src/config.rs is implemented in a later version.
+
+[server]
+address = "127.0.0.1:8080"
