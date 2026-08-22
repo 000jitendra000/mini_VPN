@@ -1,17 +1,22 @@
-//! TCP byte-tunnel client (v0.1) and VPN client (v0.3).
+//! TCP byte-tunnel client (v0.1) and VPN client (v0.3, extended in v0.4).
 //!
 //! `run()` is the original v0.1 mode: it relays stdin -> socket and
 //! socket -> stdout, so the raw byte tunnel can be exercised interactively
 //! or with piped input.
 //!
-//! `run_vpn()` is new in v0.3: it creates a TUN interface, connects to a
-//! VPN server, and relays raw IP packets between the two, in both
+//! `run_vpn()` is v0.3: it creates a TUN interface, connects to a VPN
+//! server over TCP, and relays raw IP packets between the two, in both
 //! directions, concurrently.
+//!
+//! `run_udp_vpn()` is new in v0.4: same idea as `run_vpn()`, but the
+//! transport is a UDP socket instead of a TCP stream, so each TUN packet
+//! becomes exactly one UDP datagram.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::thread;
 
+use crate::transport;
 use crate::tun;
 
 /// Connect to `address` and relay bytes between stdio and the connection.
@@ -102,6 +107,53 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("Client TUN->TCP error: {e}"),
         Err(_) => eprintln!("Client TUN->TCP thread panicked"),
+    }
+
+    download_result
+}
+
+/// Create the client TUN interface, bind a UDP socket, connect it to the
+/// server's UDP address, and relay raw IP packets between the TUN device
+/// and the socket in both directions, concurrently.
+///
+/// One TUN read becomes exactly one UDP datagram, and vice versa -- unlike
+/// v0.3's TCP relay, no byte-stream reassembly issue exists here, because
+/// UDP preserves datagram boundaries on its own.
+pub fn run_udp_vpn(server_address: &str) -> io::Result<()> {
+    let tun_device = tun::create_device(
+        tun::CLIENT_TUN_NAME,
+        tun::CLIENT_TUN_ADDRESS,
+        tun::VPN_TUN_NETMASK,
+    )?;
+    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
+    println!(
+        "Client TUN '{}' is up at {a}.{b}.{c}.{d}/24",
+        tun::CLIENT_TUN_NAME
+    );
+
+    // Bind to an OS-assigned local port; we only ever talk to one server.
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect(server_address)?;
+    println!(
+        "UDP socket bound to {} and connected to server at {server_address}",
+        socket.local_addr()?
+    );
+
+    let (tun_reader, tun_writer) = tun_device.split();
+    let upload_socket = socket.try_clone()?;
+
+    // Thread: TUN -> UDP (packets captured from the local TUN device are
+    // sent to the server as datagrams).
+    let upload_thread = thread::spawn(move || transport::relay_tun_to_udp(tun_reader, &upload_socket, "Client"));
+
+    // Main thread: UDP -> TUN (datagrams arriving from the server are
+    // written into the local TUN device).
+    let download_result = transport::relay_udp_to_tun(&socket, tun_writer, "Client");
+
+    match upload_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("Client TUN->UDP error: {e}"),
+        Err(_) => eprintln!("Client TUN->UDP thread panicked"),
     }
 
     download_result

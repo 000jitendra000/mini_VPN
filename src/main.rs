@@ -35,9 +35,11 @@ fn main() {
         }
         "vpn-server" => server::run_vpn(&require_address(program, &args, mode)),
         "vpn-client" => client::run_vpn(&require_address(program, &args, mode)),
+        "udp-server" => server::run_udp_vpn(&require_address(program, &args, mode)),
+        "udp-client" => client::run_udp_vpn(&require_address(program, &args, mode)),
         other => {
             eprintln!(
-                "Unknown mode '{other}'. Expected 'server', 'client', 'tun', 'vpn-server', or 'vpn-client'."
+                "Unknown mode '{other}'. Expected 'server', 'client', 'tun', 'vpn-server', 'vpn-client', 'udp-server', or 'udp-client'."
             );
             print_usage(program);
             process::exit(1);
@@ -69,4 +71,6 @@ fn print_usage(program: &str) {
     eprintln!("  {program} tun                    (v0.2: standalone TUN packet dump)");
     eprintln!("  {program} vpn-server <address>   (v0.3: TUN <-> TCP server)");
     eprintln!("  {program} vpn-client <address>   (v0.3: TUN <-> TCP client)");
+    eprintln!("  {program} udp-server <address>   (v0.4: TUN <-> UDP server)");
+    eprintln!("  {program} udp-client <address>   (v0.4: TUN <-> UDP client)");
 }
