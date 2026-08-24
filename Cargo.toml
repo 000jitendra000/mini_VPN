@@ -1,7 +1,14 @@
 [package]
 name = "tiny-vpn"
-version = "0.3.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
 tun = "=0.7.5"
+chacha20poly1305 = "0.10"
+# Pinned: chacha20poly1305's default dependency chain otherwise pulls in a
+# zeroize version that requires Rust edition2024 (rustc 1.85+), which this
+# sandbox's rustc 1.75.0 cannot build. 1.7.0 is the newest edition-2021
+# release and is functionally equivalent for our purposes.
+zeroize = "=1.7.0"
+ 

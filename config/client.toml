@@ -1,8 +1,20 @@
-# Placeholder client config file.
+# Client config file.
 #
-# Not read by tiny-vpn yet -- config-file loading is not part of v0.1 or
-# v0.2. This file exists so the intended config format has a home once
-# src/config.rs is implemented in a later version.
+# [server] is a placeholder for a later version (persistent
+# reconnect/config, v0.9) -- not read by tiny-vpn yet.
+#
+# [crypto] is read by \`udp-client\`/\`udp-server\` starting at v0.6: it's
+# the pre-shared key used for ChaCha20-Poly1305 encryption. Both the
+# client and server config files must contain the SAME key, or decryption
+# will fail authentication on both sides.
+#
+# WARNING: this default key is committed to the repo purely so the v0.6
+# demo works out of the box. Never do this for a real deployment --
+# generate your own key (e.g. \`openssl rand -hex 32\`) and keep it out of
+# version control.
 
 [server]
 address = "127.0.0.1:8080"
+
+[crypto]
+key = "2e2be72ff8bfebda19ce83587584352b7e950ab323236f72e13ad9023a0711f6"

@@ -1,4 +1,5 @@
-//! TCP byte-tunnel server (v0.1) and VPN server (v0.3, extended in v0.4).
+//! TCP byte-tunnel server (v0.1) and VPN server (v0.3, extended in v0.4
+//! with UDP transport and in v0.6 with encryption).
 //!
 //! `run()` is the original v0.1 mode: it accepts one client connection at
 //! a time and relays raw bytes between the tunnel and the client itself,
@@ -8,18 +9,34 @@
 //! and relays raw IP packets between the TUN device and a TCP connection,
 //! in both directions, concurrently.
 //!
-//! `run_udp_vpn()` is new in v0.4: same idea, but over UDP. Since UDP is
-//! connectionless, the server doesn't "accept" a client -- it just
-//! remembers the address of whichever peer most recently sent it a
-//! datagram, and sends replies there. No client table, no authentication.
+//! `run_udp_vpn()` is v0.4/v0.6: same idea, but over UDP, and (as of v0.6)
+//! every datagram is ChaCha20-Poly1305 encrypted using a pre-shared key
+//! loaded from a config file. Since UDP is connectionless, the server
+//! doesn't "accept" a client -- it just remembers the address of whichever
+//! peer most recently sent it a datagram that decrypted and authenticated
+//! successfully, and sends replies there. No client table, no peer
+//! authentication (that's v0.7).
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::config;
+use crate::crypto::{self, Cipher, Direction};
 use crate::transport;
 use crate::tun;
+
+/// Load the pre-shared key from `config_path` and build a `Cipher` from
+/// it. Wraps config/key errors as `io::Error` so callers can use `?`
+/// alongside the rest of this module's I/O.
+fn load_cipher(config_path: &str) -> io::Result<Cipher> {
+    let key_hex = config::load_crypto_key_hex(config_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let key = crypto::parse_key_hex(&key_hex)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(Cipher::new(key))
+}
 
 /// Bind to `address` and serve one client connection at a time, forever.
 pub fn run(address: &str) -> io::Result<()> {
@@ -105,15 +122,22 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
     download_result
 }
 
-/// Bind a UDP socket on `bind_address`, create the server TUN interface,
-/// and relay raw IP packets between the TUN device and the socket in both
-/// directions, concurrently.
+/// Bind a UDP socket on `bind_address`, load the pre-shared key from
+/// `config_path`, create the server TUN interface, and relay raw IP
+/// packets between the TUN device and the socket in both directions,
+/// concurrently.
 ///
 /// UDP is connectionless, so there's no "accept" step: the server just
 /// remembers the address of whichever peer most recently sent it a
-/// datagram (see `transport::relay_udp_to_tun_learn_peer`) and sends TUN
-/// packets there. Only one client is supported.
-pub fn run_udp_vpn(bind_address: &str) -> io::Result<()> {
+/// datagram that decrypted and authenticated successfully (see
+/// `transport::relay_udp_to_tun_learn_peer`) and sends TUN packets there.
+/// Only one client is supported. A packet that fails authentication is
+/// dropped and logged -- it is never written to TUN and never used to
+/// update the learned peer address, so forged UDP traffic cannot make the
+/// server treat an attacker as the client.
+pub fn run_udp_vpn(bind_address: &str, config_path: &str) -> io::Result<()> {
+    let cipher = Arc::new(load_cipher(config_path)?);
+
     let socket = UdpSocket::bind(bind_address)?;
     println!("VPN UDP server listening on {bind_address}");
 
@@ -132,21 +156,39 @@ pub fn run_udp_vpn(bind_address: &str) -> io::Result<()> {
     let download_socket = socket.try_clone()?;
 
     // Shared with both threads: the most recent client address seen. None
-    // until the client's first datagram arrives.
+    // until the client's first (successfully authenticated) datagram
+    // arrives.
     let peer_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let upload_peer_addr = Arc::clone(&peer_addr);
+    let upload_cipher = Arc::clone(&cipher);
 
     // Thread: TUN -> UDP (packets captured from the server's TUN device
-    // are sent to whichever client address is currently known).
+    // are framed, encrypted as Server->Client, and sent to whichever
+    // client address is currently known).
     let upload_thread = thread::spawn(move || {
-        transport::relay_tun_to_udp_to_peer(tun_reader, &socket, "Server", upload_peer_addr)
+        transport::relay_tun_to_udp_to_peer(
+            tun_reader,
+            &socket,
+            "Server",
+            upload_peer_addr,
+            &upload_cipher,
+            Direction::ServerToClient,
+        )
     });
 
     // Main thread: UDP -> TUN (datagrams arriving from the client are
-    // written into the server's TUN device; this also learns/updates the
-    // client's address for the upload thread to use).
-    let download_result =
-        transport::relay_udp_to_tun_learn_peer(&download_socket, tun_writer, "Server", peer_addr);
+    // decrypted as Client->Server, authenticated, and written into the
+    // server's TUN device; this also learns/updates the client's address
+    // for the upload thread to use -- but only for packets that
+    // authenticate successfully).
+    let download_result = transport::relay_udp_to_tun_learn_peer(
+        &download_socket,
+        tun_writer,
+        "Server",
+        peer_addr,
+        &cipher,
+        Direction::ClientToServer,
+    );
 
     match upload_thread.join() {
         Ok(Ok(())) => {}

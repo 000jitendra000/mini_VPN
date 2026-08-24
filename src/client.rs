@@ -1,4 +1,5 @@
-//! TCP byte-tunnel client (v0.1) and VPN client (v0.3, extended in v0.4).
+//! TCP byte-tunnel client (v0.1) and VPN client (v0.3, extended in v0.4
+//! with UDP transport and in v0.6 with encryption).
 //!
 //! `run()` is the original v0.1 mode: it relays stdin -> socket and
 //! socket -> stdout, so the raw byte tunnel can be exercised interactively
@@ -8,16 +9,31 @@
 //! server over TCP, and relays raw IP packets between the two, in both
 //! directions, concurrently.
 //!
-//! `run_udp_vpn()` is new in v0.4: same idea as `run_vpn()`, but the
-//! transport is a UDP socket instead of a TCP stream, so each TUN packet
-//! becomes exactly one UDP datagram.
+//! `run_udp_vpn()` is v0.4/v0.6: same idea as `run_vpn()`, but the
+//! transport is a UDP socket instead of a TCP stream, and (as of v0.6)
+//! every datagram is ChaCha20-Poly1305 encrypted using a pre-shared key
+//! loaded from a config file.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::thread;
 
+use crate::config;
+use crate::crypto::{self, Cipher, Direction};
 use crate::transport;
 use crate::tun;
+
+/// Load the pre-shared key from `config_path` and build a `Cipher` from
+/// it. Wraps config/key errors as `io::Error` so callers can use `?`
+/// alongside the rest of this module's I/O.
+fn load_cipher(config_path: &str) -> io::Result<Cipher> {
+    let key_hex = config::load_crypto_key_hex(config_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let key = crypto::parse_key_hex(&key_hex)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(Cipher::new(key))
+}
 
 /// Connect to `address` and relay bytes between stdio and the connection.
 pub fn run(address: &str) -> io::Result<()> {
@@ -112,14 +128,20 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
     download_result
 }
 
-/// Create the client TUN interface, bind a UDP socket, connect it to the
-/// server's UDP address, and relay raw IP packets between the TUN device
-/// and the socket in both directions, concurrently.
+/// Create the client TUN interface, load the pre-shared key from
+/// `config_path`, bind a UDP socket, connect it to the server's UDP
+/// address, and relay raw IP packets between the TUN device and the
+/// socket in both directions, concurrently.
 ///
-/// One TUN read becomes exactly one UDP datagram, and vice versa -- unlike
-/// v0.3's TCP relay, no byte-stream reassembly issue exists here, because
-/// UDP preserves datagram boundaries on its own.
-pub fn run_udp_vpn(server_address: &str) -> io::Result<()> {
+/// Every datagram sent is a ChaCha20-Poly1305-encrypted, framed IP packet
+/// (see `transport.rs` and `crypto.rs`); every datagram received is
+/// decrypted and authenticated before its payload is written to the TUN
+/// device. A packet that fails authentication (wrong key on one side,
+/// tampering, or corruption) is dropped and logged -- never written to
+/// TUN, and never treated as valid data.
+pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
+    let cipher = Arc::new(load_cipher(config_path)?);
+
     let tun_device = tun::create_device(
         tun::CLIENT_TUN_NAME,
         tun::CLIENT_TUN_ADDRESS,
@@ -141,14 +163,30 @@ pub fn run_udp_vpn(server_address: &str) -> io::Result<()> {
 
     let (tun_reader, tun_writer) = tun_device.split();
     let upload_socket = socket.try_clone()?;
+    let upload_cipher = Arc::clone(&cipher);
 
     // Thread: TUN -> UDP (packets captured from the local TUN device are
-    // sent to the server as datagrams).
-    let upload_thread = thread::spawn(move || transport::relay_tun_to_udp(tun_reader, &upload_socket, "Client"));
+    // framed, encrypted as Client->Server, and sent to the server).
+    let upload_thread = thread::spawn(move || {
+        transport::relay_tun_to_udp(
+            tun_reader,
+            &upload_socket,
+            "Client",
+            &upload_cipher,
+            Direction::ClientToServer,
+        )
+    });
 
     // Main thread: UDP -> TUN (datagrams arriving from the server are
-    // written into the local TUN device).
-    let download_result = transport::relay_udp_to_tun(&socket, tun_writer, "Client");
+    // decrypted as Server->Client, authenticated, and written into the
+    // local TUN device).
+    let download_result = transport::relay_udp_to_tun(
+        &socket,
+        tun_writer,
+        "Client",
+        &cipher,
+        Direction::ServerToClient,
+    );
 
     match upload_thread.join() {
         Ok(Ok(())) => {}

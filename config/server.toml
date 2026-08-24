@@ -1,0 +1,14 @@
+# Server config file (new in v0.6).
+#
+# [crypto] is the pre-shared key used for ChaCha20-Poly1305 encryption by
+# \`udp-server\`. This MUST match the [crypto] key in config/client.toml,
+# or the server will fail to authenticate every packet from the client
+# (and vice versa) -- see the wrong-key test in the v0.6 writeup.
+#
+# WARNING: this default key is committed to the repo purely so the v0.6
+# demo works out of the box. Never do this for a real deployment --
+# generate your own key (e.g. \`openssl rand -hex 32\`) and keep it out of
+# version control.
+
+[crypto]
+key = "2e2be72ff8bfebda19ce83587584352b7e950ab323236f72e13ad9023a0711f6"

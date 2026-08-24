@@ -35,8 +35,16 @@ fn main() {
         }
         "vpn-server" => server::run_vpn(&require_address(program, &args, mode)),
         "vpn-client" => client::run_vpn(&require_address(program, &args, mode)),
-        "udp-server" => server::run_udp_vpn(&require_address(program, &args, mode)),
-        "udp-client" => client::run_udp_vpn(&require_address(program, &args, mode)),
+        "udp-server" => {
+            let address = require_udp_address(program, &args, mode);
+            let config_path = optional_config_path(&args, "config/server.toml");
+            server::run_udp_vpn(&address, &config_path)
+        }
+        "udp-client" => {
+            let address = require_udp_address(program, &args, mode);
+            let config_path = optional_config_path(&args, "config/client.toml");
+            client::run_udp_vpn(&address, &config_path)
+        }
         other => {
             eprintln!(
                 "Unknown mode '{other}'. Expected 'server', 'client', 'tun', 'vpn-server', 'vpn-client', 'udp-server', or 'udp-client'."
@@ -64,13 +72,32 @@ fn require_address(program: &str, args: &[String], mode: &str) -> String {
     }
 }
 
+/// Like `require_address`, but also allows one optional trailing
+/// `<config-path>` argument (used by `udp-server`/`udp-client` to load the
+/// pre-shared encryption key from a non-default config file).
+fn require_udp_address(program: &str, args: &[String], mode: &str) -> String {
+    match args.get(2) {
+        Some(address) if args.len() == 3 || args.len() == 4 => address.clone(),
+        _ => {
+            eprintln!("Usage: {program} {mode} <address> [config-path]");
+            process::exit(1);
+        }
+    }
+}
+
+/// Extract the optional `<config-path>` argument (position 3), falling
+/// back to `default` if it wasn't given.
+fn optional_config_path(args: &[String], default: &str) -> String {
+    args.get(3).cloned().unwrap_or_else(|| default.to_string())
+}
+
 fn print_usage(program: &str) {
     eprintln!("Usage:");
-    eprintln!("  {program} server <address>       (v0.1: raw TCP byte tunnel server)");
-    eprintln!("  {program} client <address>       (v0.1: raw TCP byte tunnel client)");
-    eprintln!("  {program} tun                    (v0.2: standalone TUN packet dump)");
-    eprintln!("  {program} vpn-server <address>   (v0.3: TUN <-> TCP server)");
-    eprintln!("  {program} vpn-client <address>   (v0.3: TUN <-> TCP client)");
-    eprintln!("  {program} udp-server <address>   (v0.4: TUN <-> UDP server)");
-    eprintln!("  {program} udp-client <address>   (v0.4: TUN <-> UDP client)");
+    eprintln!("  {program} server <address>                        (v0.1: raw TCP byte tunnel server)");
+    eprintln!("  {program} client <address>                        (v0.1: raw TCP byte tunnel client)");
+    eprintln!("  {program} tun                                     (v0.2: standalone TUN packet dump)");
+    eprintln!("  {program} vpn-server <address>                    (v0.3: TUN <-> TCP server)");
+    eprintln!("  {program} vpn-client <address>                    (v0.3: TUN <-> TCP client)");
+    eprintln!("  {program} udp-server <address> [config-path]      (v0.4/v0.6: encrypted TUN <-> UDP server, default config/server.toml)");
+    eprintln!("  {program} udp-client <address> [config-path]      (v0.4/v0.6: encrypted TUN <-> UDP client, default config/client.toml)");
 }
