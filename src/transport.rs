@@ -19,14 +19,16 @@
 //! side of this module still only ever sees raw, unframed, unencrypted IP
 //! packets; only the UDP side is framed and encrypted.
 //!
-//! This module knows nothing about how the TUN device was created
-//! (`tun.rs`), nothing about what's inside the IP packet (`protocol.rs`
-//! treats the payload as opaque bytes), and nothing about how encryption
-//! actually works (`crypto.rs` owns the cipher, nonce, and key handling
-//! entirely -- this module just calls `encrypt`/`decrypt`). Encryption
-//! gives us confidentiality and authenticity for what's on the wire; it
-//! does not give us peer authentication, key exchange, or replay
-//! protection -- those remain later versions.
+//! This module knows nothing about how the virtual network interface was
+//! created (`src/tun/`; this module only ever names `tun::PacketReader`/
+//! `tun::PacketWriter`, never a platform-specific type), nothing about
+//! what's inside the IP packet (`protocol.rs` treats the payload as
+//! opaque bytes), and nothing about how encryption actually works
+//! (`crypto.rs` owns the cipher, nonce, and key handling entirely -- this
+//! module just calls `encrypt`/`decrypt`). Encryption gives us
+//! confidentiality and authenticity for what's on the wire; it does not
+//! give us peer authentication, key exchange, or replay protection --
+//! those remain later versions.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
@@ -34,6 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::crypto::{self, Cipher, Direction};
 use crate::protocol::{self, Frame};
+use crate::tun::{PacketReader, PacketWriter};
 
 /// Buffer size for one TUN read: large enough for a full-MTU IP packet
 /// (see `protocol::MAX_PAYLOAD_SIZE`).
@@ -54,7 +57,7 @@ const UDP_RECV_BUFFER_SIZE: usize = crypto::COUNTER_SIZE + protocol::MAX_FRAME_S
 /// Encrypts as `direction` -- the direction this function's traffic is
 /// travelling.
 pub fn relay_tun_to_udp(
-    mut tun_reader: tun::Reader,
+    mut tun_reader: PacketReader,
     socket: &UdpSocket,
     role: &str,
     cipher: &Cipher,
@@ -94,7 +97,7 @@ pub fn relay_tun_to_udp(
 /// Decrypts assuming the sender used `direction`.
 pub fn relay_udp_to_tun(
     socket: &UdpSocket,
-    mut tun_writer: tun::Writer,
+    mut tun_writer: PacketWriter,
     role: &str,
     cipher: &Cipher,
     direction: Direction,
@@ -141,7 +144,7 @@ pub fn relay_udp_to_tun(
 /// dropped (logged), since there is nowhere to send it -- there is no
 /// client table or queueing at v0.4/v0.5/v0.6. Encrypts as `direction`.
 pub fn relay_tun_to_udp_to_peer(
-    mut tun_reader: tun::Reader,
+    mut tun_reader: PacketReader,
     socket: &UdpSocket,
     role: &str,
     peer_addr: Arc<Mutex<Option<SocketAddr>>>,
@@ -200,7 +203,7 @@ pub fn relay_tun_to_udp_to_peer(
 /// the client.
 pub fn relay_udp_to_tun_learn_peer(
     socket: &UdpSocket,
-    mut tun_writer: tun::Writer,
+    mut tun_writer: PacketWriter,
     role: &str,
     peer_addr: Arc<Mutex<Option<SocketAddr>>>,
     cipher: &Cipher,
