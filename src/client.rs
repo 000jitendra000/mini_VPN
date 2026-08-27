@@ -1,5 +1,6 @@
 //! TCP byte-tunnel client (v0.1) and VPN client (v0.3, extended in v0.4
-//! with UDP transport and in v0.6 with encryption).
+//! with UDP transport, in v0.6 with encryption, and in v0.7 with a
+//! PSK-authenticated handshake and per-session keys).
 //!
 //! `run()` is the original v0.1 mode: it relays stdin -> socket and
 //! socket -> stdout, so the raw byte tunnel can be exercised interactively
@@ -9,30 +10,35 @@
 //! server over TCP, and relays raw IP packets between the two, in both
 //! directions, concurrently.
 //!
-//! `run_udp_vpn()` is v0.4/v0.6: same idea as `run_vpn()`, but the
-//! transport is a UDP socket instead of a TCP stream, and (as of v0.6)
-//! every datagram is ChaCha20-Poly1305 encrypted using a pre-shared key
-//! loaded from a config file.
+//! `run_udp_vpn()` is v0.4/v0.6/v0.7: the client now performs a
+//! PSK-authenticated handshake with the server (`perform_handshake`)
+//! before any VPN data flows, deriving fresh per-session encryption keys
+//! instead of using the static PSK directly (see `crypto.rs`). Only after
+//! that succeeds does it create the TUN interface and start relaying.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::config;
-use crate::crypto::{self, Cipher, Direction};
+use crate::crypto::{self, SessionCiphers};
+use crate::protocol;
 use crate::transport;
 use crate::tun;
 
-/// Load the pre-shared key from `config_path` and build a `Cipher` from
-/// it. Wraps config/key errors as `io::Error` so callers can use `?`
-/// alongside the rest of this module's I/O.
-fn load_cipher(config_path: &str) -> io::Result<Cipher> {
+/// How long to wait for the server's `HandshakeResponse` before giving
+/// up. There is no retry/reconnect logic in this project (out of scope
+/// through v0.7) -- a single bounded wait, not a retry loop.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Load and parse the pre-shared key from `config_path`. Wraps config/key
+/// errors as `io::Error` so callers can use `?` alongside the rest of
+/// this module's I/O.
+fn load_psk(config_path: &str) -> io::Result<[u8; crypto::KEY_SIZE]> {
     let key_hex = config::load_crypto_key_hex(config_path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let key = crypto::parse_key_hex(&key_hex)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    Ok(Cipher::new(key))
+    crypto::parse_key_hex(&key_hex).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 /// Connect to `address` and relay bytes between stdio and the connection.
@@ -128,19 +134,115 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
     download_result
 }
 
-/// Create the client TUN interface, load the pre-shared key from
-/// `config_path`, bind a UDP socket, connect it to the server's UDP
-/// address, and relay raw IP packets between the TUN device and the
-/// socket in both directions, concurrently.
+/// Perform the v0.7 handshake over an already-connected `socket`:
 ///
-/// Every datagram sent is a ChaCha20-Poly1305-encrypted, framed IP packet
-/// (see `transport.rs` and `crypto.rs`); every datagram received is
-/// decrypted and authenticated before its payload is written to the TUN
-/// device. A packet that fails authentication (wrong key on one side,
-/// tampering, or corruption) is dropped and logged -- never written to
-/// TUN, and never treated as valid data.
+/// ```text
+/// Client -> Server: HandshakeInit    { version, client_random }
+/// Server -> Client: HandshakeResponse{ version, server_random, tag }
+/// Client -> Server: HandshakeConfirm { tag }
+/// ```
+///
+/// The client authenticates the server's response by recomputing its tag
+/// locally from the PSK, its own `client_random`, and the received
+/// `server_random`; on success it derives fresh session keys and sends
+/// its own tag back to prove it also knows the PSK. Returns the derived
+/// `SessionCiphers` on success. Never prints the PSK, either random
+/// value, or any derived key -- only high-level progress and (via
+/// `SessionCiphers`'s fingerprints) a safe, non-secret confirmation that
+/// keys were derived.
+fn perform_handshake(socket: &UdpSocket, psk: &[u8; crypto::KEY_SIZE]) -> io::Result<SessionCiphers> {
+    let client_random = crypto::generate_random();
+
+    let init = protocol::HandshakeMessage::Init {
+        version: protocol::HANDSHAKE_VERSION,
+        client_random,
+    };
+    socket.send(&init.encode())?;
+    println!("Client: handshake started");
+
+    socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
+    let n = socket.recv(&mut buf).map_err(|e| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for handshake response")
+        }
+        _ => e,
+    })?;
+
+    let message = protocol::UdpMessage::decode(&buf[..n]).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("malformed handshake response: {e}"))
+    })?;
+
+    let (version, server_random, tag) = match message {
+        protocol::UdpMessage::Handshake(protocol::HandshakeMessage::Response {
+            version,
+            server_random,
+            tag,
+        }) => (version, server_random, tag),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a HandshakeResponse",
+            ))
+        }
+    };
+
+    if version != protocol::HANDSHAKE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported handshake version {version}"),
+        ));
+    }
+
+    let expected_tag = crypto::handshake_tag(
+        protocol::MSG_TYPE_HANDSHAKE_RESPONSE,
+        protocol::HANDSHAKE_VERSION,
+        psk,
+        &client_random,
+        &server_random,
+    );
+    if !crypto::verify_tag(&expected_tag, &tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "handshake authentication failed",
+        ));
+    }
+    println!("Client: handshake authenticated");
+
+    let session_ciphers = crypto::derive_session_ciphers(psk, &client_random, &server_random);
+
+    let client_tag = crypto::handshake_tag(
+        protocol::MSG_TYPE_HANDSHAKE_CONFIRM,
+        protocol::HANDSHAKE_VERSION,
+        psk,
+        &client_random,
+        &server_random,
+    );
+    socket.send(&protocol::HandshakeMessage::Confirm { tag: client_tag }.encode())?;
+
+    // The handshake is done; the data-relay loops that follow should
+    // block indefinitely waiting for traffic, not time out.
+    socket.set_read_timeout(None)?;
+
+    println!(
+        "Client: session established (fingerprints c->s={} s->c={})",
+        session_ciphers.client_to_server_fingerprint, session_ciphers.server_to_client_fingerprint
+    );
+
+    Ok(session_ciphers)
+}
+
+/// Create the client TUN interface, load the pre-shared key from
+/// `config_path`, bind a UDP socket, connect it to the server, complete
+/// the v0.7 handshake, and relay raw IP packets between the TUN device
+/// and the socket in both directions, concurrently, using the
+/// freshly-derived per-session keys.
+///
+/// A VPN data packet that fails authentication (which should only happen
+/// under corruption, since the session key is by now confirmed correct)
+/// is dropped and logged -- never written to TUN.
 pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
-    let cipher = Arc::new(load_cipher(config_path)?);
+    let psk = load_psk(config_path)?;
 
     let tun_device = tun::create_device(
         tun::CLIENT_TUN_NAME,
@@ -161,31 +263,35 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
         socket.local_addr()?
     );
 
+    let session_ciphers = perform_handshake(&socket, &psk)?;
+    let client_to_server = session_ciphers.client_to_server;
+    let server_to_client = session_ciphers.server_to_client;
+
     let (tun_reader, tun_writer) = tun_device.split();
     let upload_socket = socket.try_clone()?;
-    let upload_cipher = Arc::clone(&cipher);
 
     // Thread: TUN -> UDP (packets captured from the local TUN device are
-    // framed, encrypted as Client->Server, and sent to the server).
+    // framed, encrypted with this session's client-to-server key, and
+    // sent to the server).
     let upload_thread = thread::spawn(move || {
-        transport::relay_tun_to_udp(
+        transport::relay_tun_to_udp_session(
             tun_reader,
             &upload_socket,
             "Client",
-            &upload_cipher,
-            Direction::ClientToServer,
+            &client_to_server,
+            crypto::Direction::ClientToServer,
         )
     });
 
     // Main thread: UDP -> TUN (datagrams arriving from the server are
-    // decrypted as Server->Client, authenticated, and written into the
-    // local TUN device).
-    let download_result = transport::relay_udp_to_tun(
+    // decrypted with this session's server-to-client key, authenticated,
+    // and written into the local TUN device).
+    let download_result = transport::relay_udp_to_tun_session(
         &socket,
         tun_writer,
         "Client",
-        &cipher,
-        Direction::ServerToClient,
+        &server_to_client,
+        crypto::Direction::ServerToClient,
     );
 
     match upload_thread.join() {

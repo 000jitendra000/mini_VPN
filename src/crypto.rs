@@ -55,12 +55,32 @@
 //! reconstruct the same nonce) but is authenticated as AEAD associated
 //! data, so tampering with it in transit is detected and decryption
 //! fails -- it is never trusted blindly.
+//!
+//! # v0.7 addendum: session keys replace direct PSK use
+//!
+//! Everything above this point is the unmodified v0.6 `Cipher`. As of
+//! v0.7, `Cipher::new` is no longer ever called with the raw pre-shared
+//! key directly -- it's called with a *session key* produced by
+//! [`derive_session_ciphers`] after a successful handshake. Each new
+//! session derives fresh, independent `client_to_server`/
+//! `server_to_client` keys from `(PSK, client_random, server_random)` via
+//! HKDF-SHA256, so a freshly-restarted process gets a **different** key
+//! for the same PSK, which is what actually fixes the v0.6 restart/nonce-
+//! reuse problem documented above -- not a change to the nonce
+//! construction itself (which is unchanged and still correct on its own
+//! terms). A `Cipher`'s counter is still allowed to start at 0 for a new
+//! session precisely because it now pairs with a key that has never been
+//! used before.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hkdf::Hkdf;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 /// Size of a raw pre-shared key in bytes (256 bits).
 pub const KEY_SIZE: usize = 32;
@@ -164,6 +184,17 @@ pub struct Cipher {
     send_counter: AtomicU64,
 }
 
+impl std::fmt::Debug for Cipher {
+    /// Deliberately prints nothing about the key or counter state --
+    /// this exists only so `Cipher`/`Arc<Cipher>` can appear inside
+    /// `#[derive(Debug)]` types elsewhere (e.g. `server::ServerAction`)
+    /// without ever risking exposing secret material through a derived
+    /// or manual `{:?}` format.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cipher").finish_non_exhaustive()
+    }
+}
+
 impl Cipher {
     /// Build a cipher from raw key bytes. The key is moved in and never
     /// exposed again -- there is no accessor for it.
@@ -255,6 +286,179 @@ fn build_nonce(direction: Direction, counter: u64) -> Nonce {
     // bytes[1..4] intentionally left as zero padding.
     bytes[4..12].copy_from_slice(&counter.to_be_bytes());
     *Nonce::from_slice(&bytes)
+}
+
+// ============================================================================
+// v0.7: handshake authentication and session key derivation.
+//
+// Everything below is new. It does not change `Cipher`, `Direction`,
+// `build_nonce`, or the v0.6 envelope format above -- it only adds what's
+// needed to (a) authenticate a handshake using the PSK, and (b) derive
+// fresh session keys from the PSK plus both sides' handshake randomness,
+// so a restarted process gets a new key instead of reusing the old one
+// under the same key (see the module-level "v0.7 addendum" docs above).
+//
+// # Construction
+//
+// Both the handshake authentication tags and the session keys are
+// produced by the same primitive: HKDF-SHA256 (RustCrypto `hkdf` crate),
+// keyed by the PSK, with domain separation via the `info` parameter:
+//
+// ```text
+// PRK = HKDF-Extract(salt = None, ikm = PSK)      [Hkdf::new(None, psk)]
+//
+// handshake tag  = HKDF-Expand(PRK, info = "tiny-vpn-v0.7" || message_type
+//                                          || version || client_random
+//                                          || server_random,           32 bytes)
+//
+// session key    = HKDF-Expand(PRK, info = "tiny-vpn-v0.7-session-"    32 bytes)
+//                                          || direction_label
+//                                          || client_random || server_random,
+// ```
+//
+// Using HKDF-Expand output as an authentication tag (recompute and
+// compare) rather than a general-purpose MAC avoids adding a second
+// primitive (e.g. a separate `hmac` crate) beyond the one KDF the spec
+// asks for: HKDF-Expand is a PRF keyed by the PSK-derived PRK, so nobody
+// without the PSK can predict its output for a given `info`, which is
+// exactly the property an authentication tag needs.
+//
+// `message_type` and `version` are included in every handshake tag's
+// `info` so a tag computed for one message type/version can never be
+// replayed as valid for another. `client_random`/`server_random` bind
+// the tag to this specific handshake attempt.
+// ============================================================================
+
+/// Size of the random value each side contributes to a handshake.
+pub const RANDOM_SIZE: usize = 32;
+
+/// Size of a handshake authentication tag (an HKDF-Expand output).
+pub const HANDSHAKE_TAG_SIZE: usize = 32;
+
+const HKDF_CONTEXT_PREFIX: &[u8] = b"tiny-vpn-v0.7";
+
+/// Generate a fresh, cryptographically secure random value for use as a
+/// handshake's `client_random`/`server_random`. Backed by the OS CSPRNG
+/// (`OsRng`, via `chacha20poly1305`'s existing `getrandom`-based
+/// re-export -- no separate RNG dependency is needed). Never a timestamp,
+/// counter, PID, or any other non-CSPRNG source.
+pub fn generate_random() -> [u8; RANDOM_SIZE] {
+    let mut bytes = [0u8; RANDOM_SIZE];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+/// Derive one 32-byte HKDF-Expand output from `psk` and `info`. Private:
+/// every public use of this (tags, session keys) goes through the
+/// functions below so the `info` construction stays consistent and
+/// documented in one place.
+fn hkdf_expand_32(psk: &[u8; KEY_SIZE], info: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, psk);
+    let mut out = [0u8; 32];
+    hk.expand(info, &mut out)
+        .expect("32-byte output is always valid for HKDF-SHA256 (max is 255*32 bytes)");
+    out
+}
+
+/// Compute the authentication tag for a handshake message, binding
+/// `message_type`, `version`, `client_random`, and `server_random` --
+/// exactly the values the v0.7 spec requires a handshake tag to cover.
+/// Used for both the server's `Response` tag and the client's `Confirm`
+/// tag; `message_type` (the two are different constants -- see
+/// `protocol::MSG_TYPE_HANDSHAKE_RESPONSE`/`MSG_TYPE_HANDSHAKE_CONFIRM`)
+/// keeps the two tags from ever being valid for each other's purpose.
+pub fn handshake_tag(
+    message_type: u8,
+    version: u8,
+    psk: &[u8; KEY_SIZE],
+    client_random: &[u8; RANDOM_SIZE],
+    server_random: &[u8; RANDOM_SIZE],
+) -> [u8; HANDSHAKE_TAG_SIZE] {
+    let mut info = Vec::with_capacity(HKDF_CONTEXT_PREFIX.len() + 2 + RANDOM_SIZE * 2);
+    info.extend_from_slice(HKDF_CONTEXT_PREFIX);
+    info.push(message_type);
+    info.push(version);
+    info.extend_from_slice(client_random);
+    info.extend_from_slice(server_random);
+    hkdf_expand_32(psk, &info)
+}
+
+/// Constant-time comparison of a received tag against the expected one.
+/// Always use this (never `==`) to compare handshake tags, so a mismatch
+/// can't be distinguished by timing.
+pub fn verify_tag(
+    expected: &[u8; HANDSHAKE_TAG_SIZE],
+    received: &[u8; HANDSHAKE_TAG_SIZE],
+) -> bool {
+    expected.ct_eq(received).into()
+}
+
+/// The two independent, freshly-derived ciphers for one session, plus
+/// non-secret fingerprints of each key safe to log for debugging/testing
+/// (see [`key_fingerprint`]).
+pub struct SessionCiphers {
+    pub client_to_server: Cipher,
+    pub server_to_client: Cipher,
+    pub client_to_server_fingerprint: String,
+    pub server_to_client_fingerprint: String,
+}
+
+/// Derive fresh, independent session keys for both directions from `psk`,
+/// `client_random`, and `server_random`, and build a `Cipher` for each.
+///
+/// Called once per successfully authenticated handshake. Because
+/// `client_random`/`server_random` are freshly generated for every
+/// session (see `generate_random`), every session's keys differ from
+/// every other session's, even under the same static PSK -- this is what
+/// makes it safe for each new session's `Cipher` to start its counter at
+/// 0 (see the module-level "v0.7 addendum" docs).
+pub fn derive_session_ciphers(
+    psk: &[u8; KEY_SIZE],
+    client_random: &[u8; RANDOM_SIZE],
+    server_random: &[u8; RANDOM_SIZE],
+) -> SessionCiphers {
+    let c2s_key = hkdf_expand_32(
+        psk,
+        &session_info(b"client-to-server", client_random, server_random),
+    );
+    let s2c_key = hkdf_expand_32(
+        psk,
+        &session_info(b"server-to-client", client_random, server_random),
+    );
+
+    SessionCiphers {
+        client_to_server_fingerprint: key_fingerprint(&c2s_key),
+        server_to_client_fingerprint: key_fingerprint(&s2c_key),
+        client_to_server: Cipher::new(c2s_key),
+        server_to_client: Cipher::new(s2c_key),
+    }
+}
+
+fn session_info(
+    direction_label: &[u8],
+    client_random: &[u8; RANDOM_SIZE],
+    server_random: &[u8; RANDOM_SIZE],
+) -> Vec<u8> {
+    let mut info = Vec::with_capacity(
+        HKDF_CONTEXT_PREFIX.len() + 9 + direction_label.len() + RANDOM_SIZE * 2,
+    );
+    info.extend_from_slice(HKDF_CONTEXT_PREFIX);
+    info.extend_from_slice(b"-session-");
+    info.extend_from_slice(direction_label);
+    info.extend_from_slice(client_random);
+    info.extend_from_slice(server_random);
+    info
+}
+
+/// A short, non-secret fingerprint of a session key, safe to log or
+/// compare across runs -- e.g. to demonstrate that two sessions derived
+/// different key material without ever printing an actual key. This is
+/// NOT a security mechanism (it's a one-way hash truncated for
+/// readability, not a commitment scheme); it exists purely for
+/// observability and testing (see the v0.7 restart test).
+fn key_fingerprint(key: &[u8; KEY_SIZE]) -> String {
+    let hash = Sha256::digest(key);
+    hash[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -395,5 +599,215 @@ mod tests {
     fn key_hex_invalid_characters_are_rejected() {
         let bad = "zz".repeat(KEY_SIZE);
         assert!(matches!(parse_key_hex(&bad), Err(CryptoError::InvalidKeyHex)));
+    }
+
+    // ------------------------------------------------------------------
+    // v0.7 handshake authentication / session key derivation tests
+    // ------------------------------------------------------------------
+
+    fn test_psk(byte: u8) -> [u8; KEY_SIZE] {
+        [byte; KEY_SIZE]
+    }
+
+    fn test_random(byte: u8) -> [u8; RANDOM_SIZE] {
+        [byte; RANDOM_SIZE]
+    }
+
+    #[test]
+    fn generated_randoms_differ() {
+        // Not a proof of CSPRNG quality, just a sanity check that we're
+        // not accidentally returning a constant or predictable value.
+        let a = generate_random();
+        let b = generate_random();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn handshake_tag_round_trip_with_matching_psk() {
+        let psk = test_psk(0x01);
+        let client_random = test_random(0xAA);
+        let server_random = test_random(0xBB);
+        let tag = handshake_tag(2, 1, &psk, &client_random, &server_random);
+        let recomputed = handshake_tag(2, 1, &psk, &client_random, &server_random);
+        assert!(verify_tag(&tag, &recomputed));
+    }
+
+    #[test]
+    fn handshake_tag_wrong_psk_fails() {
+        let client_random = test_random(0xAA);
+        let server_random = test_random(0xBB);
+        let tag_a = handshake_tag(2, 1, &test_psk(0x01), &client_random, &server_random);
+        let tag_b = handshake_tag(2, 1, &test_psk(0x02), &client_random, &server_random);
+        assert!(!verify_tag(&tag_a, &tag_b));
+    }
+
+    #[test]
+    fn handshake_tag_modified_client_random_fails() {
+        let psk = test_psk(0x01);
+        let server_random = test_random(0xBB);
+        let tag = handshake_tag(2, 1, &psk, &test_random(0xAA), &server_random);
+        let recomputed = handshake_tag(2, 1, &psk, &test_random(0xAC), &server_random);
+        assert!(!verify_tag(&tag, &recomputed));
+    }
+
+    #[test]
+    fn handshake_tag_modified_server_random_fails() {
+        let psk = test_psk(0x01);
+        let client_random = test_random(0xAA);
+        let tag = handshake_tag(2, 1, &psk, &client_random, &test_random(0xBB));
+        let recomputed = handshake_tag(2, 1, &psk, &client_random, &test_random(0xBC));
+        assert!(!verify_tag(&tag, &recomputed));
+    }
+
+    #[test]
+    fn handshake_tag_modified_message_type_fails() {
+        let psk = test_psk(0x01);
+        let client_random = test_random(0xAA);
+        let server_random = test_random(0xBB);
+        // Response tag (type 2) must not validate as a Confirm tag (type 3).
+        let response_tag = handshake_tag(2, 1, &psk, &client_random, &server_random);
+        let confirm_tag = handshake_tag(3, 1, &psk, &client_random, &server_random);
+        assert!(!verify_tag(&response_tag, &confirm_tag));
+    }
+
+    #[test]
+    fn handshake_tag_modified_version_fails() {
+        let psk = test_psk(0x01);
+        let client_random = test_random(0xAA);
+        let server_random = test_random(0xBB);
+        let tag_v1 = handshake_tag(2, 1, &psk, &client_random, &server_random);
+        let tag_v2 = handshake_tag(2, 2, &psk, &client_random, &server_random);
+        assert!(!verify_tag(&tag_v1, &tag_v2));
+    }
+
+    #[test]
+    fn different_client_randoms_produce_different_session_material() {
+        let psk = test_psk(0x10);
+        let server_random = test_random(0x20);
+        let session_a = derive_session_ciphers(&psk, &test_random(0x01), &server_random);
+        let session_b = derive_session_ciphers(&psk, &test_random(0x02), &server_random);
+        assert_ne!(
+            session_a.client_to_server_fingerprint,
+            session_b.client_to_server_fingerprint
+        );
+        assert_ne!(
+            session_a.server_to_client_fingerprint,
+            session_b.server_to_client_fingerprint
+        );
+    }
+
+    #[test]
+    fn different_server_randoms_produce_different_session_material() {
+        let psk = test_psk(0x10);
+        let client_random = test_random(0x20);
+        let session_a = derive_session_ciphers(&psk, &client_random, &test_random(0x01));
+        let session_b = derive_session_ciphers(&psk, &client_random, &test_random(0x02));
+        assert_ne!(
+            session_a.client_to_server_fingerprint,
+            session_b.client_to_server_fingerprint
+        );
+        assert_ne!(
+            session_a.server_to_client_fingerprint,
+            session_b.server_to_client_fingerprint
+        );
+    }
+
+    #[test]
+    fn two_complete_handshakes_produce_different_session_keys() {
+        // Simulates the v0.7 restart scenario: same PSK, but a fresh
+        // handshake (fresh randoms) each time -- session A and session B
+        // must not share key material.
+        let psk = test_psk(0x42);
+
+        let session_a = derive_session_ciphers(&psk, &generate_random(), &generate_random());
+        let session_b = derive_session_ciphers(&psk, &generate_random(), &generate_random());
+
+        assert_ne!(
+            session_a.client_to_server_fingerprint,
+            session_b.client_to_server_fingerprint
+        );
+        assert_ne!(
+            session_a.server_to_client_fingerprint,
+            session_b.server_to_client_fingerprint
+        );
+    }
+
+    #[test]
+    fn directional_session_keys_differ() {
+        let psk = test_psk(0x55);
+        let client_random = test_random(0x01);
+        let server_random = test_random(0x02);
+        let session = derive_session_ciphers(&psk, &client_random, &server_random);
+        assert_ne!(
+            session.client_to_server_fingerprint,
+            session.server_to_client_fingerprint
+        );
+    }
+
+    #[test]
+    fn session_cross_direction_key_cannot_decrypt() {
+        // A client->server encrypted packet must not be decryptable with
+        // the server->client key from the same session.
+        let psk = test_psk(0x66);
+        let client_random = test_random(0x01);
+        let server_random = test_random(0x02);
+        let session = derive_session_ciphers(&psk, &client_random, &server_random);
+
+        let envelope = session
+            .client_to_server
+            .encrypt(Direction::ClientToServer, b"secret payload");
+
+        assert!(matches!(
+            session
+                .server_to_client
+                .decrypt(Direction::ClientToServer, &envelope),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn session_from_old_handshake_cannot_be_decrypted_by_new_session() {
+        // Session A encrypts a packet; session B (a later, independent
+        // handshake under the same PSK) must not be able to decrypt it,
+        // even though both use the same Direction tag.
+        let psk = test_psk(0x77);
+        let session_a = derive_session_ciphers(&psk, &test_random(0x01), &test_random(0x02));
+        let session_b = derive_session_ciphers(&psk, &test_random(0x03), &test_random(0x04));
+
+        let envelope_from_a = session_a
+            .client_to_server
+            .encrypt(Direction::ClientToServer, b"session A data");
+
+        assert!(matches!(
+            session_b
+                .client_to_server
+                .decrypt(Direction::ClientToServer, &envelope_from_a),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn fresh_session_counter_at_zero_does_not_reuse_old_session_nonce() {
+        // The core v0.7 fix: session A's Cipher and session B's Cipher
+        // both start their counter at 0, but because their keys differ,
+        // the (key, nonce) pairs never collide -- so encrypting the same
+        // plaintext under counter 0 in both sessions produces different,
+        // safe ciphertexts.
+        let psk = test_psk(0x88);
+        let session_a = derive_session_ciphers(&psk, &test_random(0x01), &test_random(0x02));
+        let session_b = derive_session_ciphers(&psk, &test_random(0x03), &test_random(0x04));
+
+        let plaintext = b"identical plaintext, counter 0 in both sessions";
+        let envelope_a = session_a
+            .client_to_server
+            .encrypt(Direction::ClientToServer, plaintext);
+        let envelope_b = session_b
+            .client_to_server
+            .encrypt(Direction::ClientToServer, plaintext);
+
+        // Same counter (0) is visible in both envelopes' first 8 bytes...
+        assert_eq!(&envelope_a[..COUNTER_SIZE], &envelope_b[..COUNTER_SIZE]);
+        // ...but the ciphertexts differ, because the keys differ.
+        assert_ne!(envelope_a, envelope_b);
     }
 }

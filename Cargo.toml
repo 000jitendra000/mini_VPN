@@ -1,6 +1,6 @@
 [package]
 name = "tiny-vpn"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -11,3 +11,13 @@ chacha20poly1305 = "0.10"
 # sandbox's rustc 1.75.0 cannot build. 1.7.0 is the newest edition-2021
 # release and is functionally equivalent for our purposes.
 zeroize = "=1.7.0"
+# v0.7: standard KDF for handshake authentication tags and session key
+# derivation (HKDF-SHA256, RustCrypto). Both compile cleanly under this
+# sandbox's rustc 1.75.0 (probed before adding).
+hkdf = "0.12"
+sha2 = "0.10"
+# v0.7: constant-time comparison for handshake authentication tags. Was
+# already a transitive dependency (pulled in by chacha20poly1305's
+# poly1305/universal-hash chain); declared directly here because our own
+# code now uses it too.
+subtle = "2.6"

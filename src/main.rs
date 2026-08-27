@@ -98,6 +98,6 @@ fn print_usage(program: &str) {
     eprintln!("  {program} tun                                     (v0.2: standalone TUN packet dump)");
     eprintln!("  {program} vpn-server <address>                    (v0.3: TUN <-> TCP server)");
     eprintln!("  {program} vpn-client <address>                    (v0.3: TUN <-> TCP client)");
-    eprintln!("  {program} udp-server <address> [config-path]      (v0.4/v0.6: encrypted TUN <-> UDP server, default config/server.toml)");
-    eprintln!("  {program} udp-client <address> [config-path]      (v0.4/v0.6: encrypted TUN <-> UDP client, default config/client.toml)");
+    eprintln!("  {program} udp-server <address> [config-path]      (v0.4/v0.6/v0.7: handshake-authenticated, encrypted TUN <-> UDP server, default config/server.toml)");
+    eprintln!("  {program} udp-client <address> [config-path]      (v0.4/v0.6/v0.7: handshake-authenticated, encrypted TUN <-> UDP client, default config/client.toml)");
 }

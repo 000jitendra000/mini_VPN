@@ -226,6 +226,263 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+// ============================================================================
+// v0.7: handshake protocol message types.
+//
+// This is a SEPARATE, sibling wire format to the `Frame` format above --
+// handshake messages are never wrapped in a `Frame`, and a decrypted
+// `Frame` never appears anywhere outside an `EncryptedData` message's
+// body. The two protocols share this file because both are "the VPN wire
+// protocol", but they don't share types, constants, or codecs.
+//
+// Every UDP datagram sent by the v0.7 transport begins with one message-
+// type byte, so a receiver can tell handshake traffic apart from
+// encrypted VPN data without guessing:
+//
+// ```text
+// byte 0: message type
+//   0x01 = HandshakeInit      (Client -> Server)
+//   0x02 = HandshakeResponse  (Server -> Client)
+//   0x03 = HandshakeConfirm   (Client -> Server)
+//   0x04 = EncryptedData      (either direction)
+// bytes 1..: message-type-specific body
+// ```
+//
+// `EncryptedData`'s body is the existing, completely unmodified v0.6
+// encryption envelope (`counter(8) || ciphertext || tag`) -- this module
+// does not touch it beyond slicing off the leading type byte; encryption
+// itself is `crypto.rs`'s job.
+// ============================================================================
+
+/// Size of the random value each side contributes to a handshake.
+///
+/// `crypto::RANDOM_SIZE` produces exactly this many bytes; the two
+/// constants are defined independently (in different modules, each with
+/// no dependency on the other) rather than one importing the other, to
+/// keep `protocol.rs` free of any dependency on `crypto.rs`. Keep them in
+/// sync if either changes.
+pub const HANDSHAKE_RANDOM_SIZE: usize = 32;
+
+/// Size of the authentication tag attached to `Response`/`Confirm`
+/// messages. `crypto::HANDSHAKE_TAG_SIZE` produces exactly this many
+/// bytes (currently via HKDF-SHA256); this module only ever treats a tag
+/// as an opaque, fixed-size byte array to encode/decode -- it never
+/// computes or verifies one itself.
+pub const HANDSHAKE_TAG_SIZE: usize = 32;
+
+/// The only handshake protocol version that currently exists.
+pub const HANDSHAKE_VERSION: u8 = 1;
+
+/// Leading message-type byte for each kind of v0.7 UDP datagram.
+pub const MSG_TYPE_HANDSHAKE_INIT: u8 = 1;
+pub const MSG_TYPE_HANDSHAKE_RESPONSE: u8 = 2;
+pub const MSG_TYPE_HANDSHAKE_CONFIRM: u8 = 3;
+pub const MSG_TYPE_ENCRYPTED_DATA: u8 = 4;
+
+/// A handshake message. Does not include `EncryptedData` -- see
+/// [`UdpMessage`] for the outer type that also distinguishes encrypted
+/// data from handshake traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeMessage {
+    /// Client -> Server: "let's start a session; here's my randomness."
+    Init {
+        version: u8,
+        client_random: [u8; HANDSHAKE_RANDOM_SIZE],
+    },
+    /// Server -> Client: "here's my randomness, and proof I know the PSK
+    /// (a tag over version + client_random + server_random)."
+    Response {
+        version: u8,
+        server_random: [u8; HANDSHAKE_RANDOM_SIZE],
+        tag: [u8; HANDSHAKE_TAG_SIZE],
+    },
+    /// Client -> Server: "proof I also know the PSK (a tag over the same
+    /// values, with a different message-type domain separator)."
+    Confirm { tag: [u8; HANDSHAKE_TAG_SIZE] },
+}
+
+impl HandshakeMessage {
+    /// The leading wire byte for this message's variant.
+    pub fn message_type(&self) -> u8 {
+        match self {
+            HandshakeMessage::Init { .. } => MSG_TYPE_HANDSHAKE_INIT,
+            HandshakeMessage::Response { .. } => MSG_TYPE_HANDSHAKE_RESPONSE,
+            HandshakeMessage::Confirm { .. } => MSG_TYPE_HANDSHAKE_CONFIRM,
+        }
+    }
+
+    /// Serialize this message to bytes, including the leading type byte.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = vec![self.message_type()];
+        match self {
+            HandshakeMessage::Init {
+                version,
+                client_random,
+            } => {
+                buf.push(*version);
+                buf.extend_from_slice(client_random);
+            }
+            HandshakeMessage::Response {
+                version,
+                server_random,
+                tag,
+            } => {
+                buf.push(*version);
+                buf.extend_from_slice(server_random);
+                buf.extend_from_slice(tag);
+            }
+            HandshakeMessage::Confirm { tag } => {
+                buf.extend_from_slice(tag);
+            }
+        }
+        buf
+    }
+
+    /// Parse exactly one handshake message from `bytes` (including its
+    /// leading type byte). Every field is fixed-size, so this is a
+    /// strict, exact-length decoder: too few or too many bytes for the
+    /// indicated message type is an error, never a panic.
+    pub fn decode(bytes: &[u8]) -> Result<Self, HandshakeError> {
+        let (&message_type, rest) = bytes
+            .split_first()
+            .ok_or(HandshakeError::TooShort { have: 0, need: 1 })?;
+
+        match message_type {
+            MSG_TYPE_HANDSHAKE_INIT => {
+                let need = 1 + HANDSHAKE_RANDOM_SIZE;
+                if rest.len() != need {
+                    return Err(HandshakeError::WrongLength {
+                        message_type,
+                        have: rest.len(),
+                        need,
+                    });
+                }
+                let version = rest[0];
+                let mut client_random = [0u8; HANDSHAKE_RANDOM_SIZE];
+                client_random.copy_from_slice(&rest[1..1 + HANDSHAKE_RANDOM_SIZE]);
+                Ok(HandshakeMessage::Init {
+                    version,
+                    client_random,
+                })
+            }
+            MSG_TYPE_HANDSHAKE_RESPONSE => {
+                let need = 1 + HANDSHAKE_RANDOM_SIZE + HANDSHAKE_TAG_SIZE;
+                if rest.len() != need {
+                    return Err(HandshakeError::WrongLength {
+                        message_type,
+                        have: rest.len(),
+                        need,
+                    });
+                }
+                let version = rest[0];
+                let mut server_random = [0u8; HANDSHAKE_RANDOM_SIZE];
+                server_random.copy_from_slice(&rest[1..1 + HANDSHAKE_RANDOM_SIZE]);
+                let mut tag = [0u8; HANDSHAKE_TAG_SIZE];
+                tag.copy_from_slice(&rest[1 + HANDSHAKE_RANDOM_SIZE..]);
+                Ok(HandshakeMessage::Response {
+                    version,
+                    server_random,
+                    tag,
+                })
+            }
+            MSG_TYPE_HANDSHAKE_CONFIRM => {
+                let need = HANDSHAKE_TAG_SIZE;
+                if rest.len() != need {
+                    return Err(HandshakeError::WrongLength {
+                        message_type,
+                        have: rest.len(),
+                        need,
+                    });
+                }
+                let mut tag = [0u8; HANDSHAKE_TAG_SIZE];
+                tag.copy_from_slice(rest);
+                Ok(HandshakeMessage::Confirm { tag })
+            }
+            other => Err(HandshakeError::UnknownMessageType { found: other }),
+        }
+    }
+}
+
+/// The outermost dispatch point for a v0.7 UDP datagram: is this
+/// handshake traffic, or encrypted VPN data? `EncryptedData`'s payload is
+/// borrowed straight out of the input slice (minus the leading type
+/// byte) -- this type does not decrypt it or look inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdpMessage<'a> {
+    Handshake(HandshakeMessage),
+    EncryptedData(&'a [u8]),
+}
+
+impl<'a> UdpMessage<'a> {
+    /// Look at the leading message-type byte of `bytes` and dispatch to
+    /// either a decoded [`HandshakeMessage`] or a borrowed `EncryptedData`
+    /// body. Never panics on malformed/truncated/unknown input.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, HandshakeError> {
+        let &message_type = bytes
+            .first()
+            .ok_or(HandshakeError::TooShort { have: 0, need: 1 })?;
+        if message_type == MSG_TYPE_ENCRYPTED_DATA {
+            Ok(UdpMessage::EncryptedData(&bytes[1..]))
+        } else {
+            HandshakeMessage::decode(bytes).map(UdpMessage::Handshake)
+        }
+    }
+}
+
+/// Wrap an already-encrypted v0.6 envelope (`counter || ciphertext ||
+/// tag`, produced by `crypto::Cipher::encrypt`, untouched) in the v0.7
+/// outer `EncryptedData` message so it can be told apart from handshake
+/// traffic on the wire.
+pub fn encode_encrypted_data(envelope: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + envelope.len());
+    buf.push(MSG_TYPE_ENCRYPTED_DATA);
+    buf.extend_from_slice(envelope);
+    buf
+}
+
+/// Errors from decoding a [`HandshakeMessage`] or [`UdpMessage`].
+///
+/// Like `ProtocolError`, malformed input always produces one of these --
+/// never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeError {
+    /// Fewer bytes were supplied than even a message-type byte.
+    TooShort { have: usize, need: usize },
+    /// The leading byte isn't a message type this implementation knows.
+    UnknownMessageType { found: u8 },
+    /// The body wasn't exactly the length that `message_type` requires.
+    WrongLength {
+        message_type: u8,
+        have: usize,
+        need: usize,
+    },
+}
+
+impl fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HandshakeError::TooShort { have, need } => {
+                write!(f, "handshake message too short: have {have} bytes, need at least {need}")
+            }
+            HandshakeError::UnknownMessageType { found } => {
+                write!(f, "unknown message type: {found}")
+            }
+            HandshakeError::WrongLength {
+                message_type,
+                have,
+                need,
+            } => {
+                write!(
+                    f,
+                    "wrong length for message type {message_type}: have {have} bytes, need exactly {need}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +618,130 @@ mod tests {
 
         let decoded = Frame::decode(&encoded).unwrap();
         assert_eq!(decoded.payload, packet);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.7 handshake message tests
+    // ------------------------------------------------------------------
+
+    fn sample_random(byte: u8) -> [u8; HANDSHAKE_RANDOM_SIZE] {
+        [byte; HANDSHAKE_RANDOM_SIZE]
+    }
+
+    fn sample_tag(byte: u8) -> [u8; HANDSHAKE_TAG_SIZE] {
+        [byte; HANDSHAKE_TAG_SIZE]
+    }
+
+    #[test]
+    fn handshake_init_round_trips() {
+        let message = HandshakeMessage::Init {
+            version: HANDSHAKE_VERSION,
+            client_random: sample_random(0xAA),
+        };
+        let encoded = message.encode();
+        assert_eq!(encoded[0], MSG_TYPE_HANDSHAKE_INIT);
+        assert_eq!(encoded.len(), 1 + 1 + HANDSHAKE_RANDOM_SIZE);
+        assert_eq!(HandshakeMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn handshake_response_round_trips() {
+        let message = HandshakeMessage::Response {
+            version: HANDSHAKE_VERSION,
+            server_random: sample_random(0xBB),
+            tag: sample_tag(0xCC),
+        };
+        let encoded = message.encode();
+        assert_eq!(encoded[0], MSG_TYPE_HANDSHAKE_RESPONSE);
+        assert_eq!(
+            encoded.len(),
+            1 + 1 + HANDSHAKE_RANDOM_SIZE + HANDSHAKE_TAG_SIZE
+        );
+        assert_eq!(HandshakeMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn handshake_confirm_round_trips() {
+        let message = HandshakeMessage::Confirm {
+            tag: sample_tag(0xDD),
+        };
+        let encoded = message.encode();
+        assert_eq!(encoded[0], MSG_TYPE_HANDSHAKE_CONFIRM);
+        assert_eq!(encoded.len(), 1 + HANDSHAKE_TAG_SIZE);
+        assert_eq!(HandshakeMessage::decode(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn handshake_empty_input_is_rejected() {
+        assert!(matches!(
+            HandshakeMessage::decode(&[]),
+            Err(HandshakeError::TooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn handshake_unknown_message_type_is_rejected() {
+        assert!(matches!(
+            HandshakeMessage::decode(&[0xFF]),
+            Err(HandshakeError::UnknownMessageType { found: 0xFF })
+        ));
+    }
+
+    #[test]
+    fn handshake_truncated_init_is_rejected() {
+        let full = HandshakeMessage::Init {
+            version: HANDSHAKE_VERSION,
+            client_random: sample_random(0x11),
+        }
+        .encode();
+        let truncated = &full[..full.len() - 1];
+        assert!(matches!(
+            HandshakeMessage::decode(truncated),
+            Err(HandshakeError::WrongLength { .. })
+        ));
+    }
+
+    #[test]
+    fn handshake_extra_bytes_on_confirm_are_rejected() {
+        let mut bytes = HandshakeMessage::Confirm {
+            tag: sample_tag(0x22),
+        }
+        .encode();
+        bytes.push(0x00);
+        assert!(matches!(
+            HandshakeMessage::decode(&bytes),
+            Err(HandshakeError::WrongLength { .. })
+        ));
+    }
+
+    #[test]
+    fn udp_message_dispatches_encrypted_data() {
+        let envelope = vec![1, 2, 3, 4, 5];
+        let datagram = encode_encrypted_data(&envelope);
+        match UdpMessage::decode(&datagram) {
+            Ok(UdpMessage::EncryptedData(body)) => assert_eq!(body, envelope.as_slice()),
+            other => panic!("expected EncryptedData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn udp_message_dispatches_handshake() {
+        let message = HandshakeMessage::Init {
+            version: HANDSHAKE_VERSION,
+            client_random: sample_random(0x33),
+        };
+        let datagram = message.encode();
+        match UdpMessage::decode(&datagram) {
+            Ok(UdpMessage::Handshake(decoded)) => assert_eq!(decoded, message),
+            other => panic!("expected Handshake, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn udp_message_empty_input_is_rejected() {
+        assert!(matches!(
+            UdpMessage::decode(&[]),
+            Err(HandshakeError::TooShort { .. })
+        ));
     }
 }
