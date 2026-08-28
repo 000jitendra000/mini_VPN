@@ -244,17 +244,6 @@ fn perform_handshake(socket: &UdpSocket, psk: &[u8; crypto::KEY_SIZE]) -> io::Re
 pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
     let psk = load_psk(config_path)?;
 
-    let tun_device = tun::create_device(
-        tun::CLIENT_TUN_NAME,
-        tun::CLIENT_TUN_ADDRESS,
-        tun::VPN_TUN_NETMASK,
-    )?;
-    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
-    println!(
-        "Client TUN '{}' is up at {a}.{b}.{c}.{d}/24",
-        tun::CLIENT_TUN_NAME
-    );
-
     // Bind to an OS-assigned local port; we only ever talk to one server.
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(server_address)?;
@@ -266,6 +255,21 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
     let session_ciphers = perform_handshake(&socket, &psk)?;
     let client_to_server = session_ciphers.client_to_server;
     let server_to_client = session_ciphers.server_to_client;
+
+    // Only now -- after the handshake has authenticated the server and
+    // fresh session keys exist -- do we create the TUN interface. If
+    // `perform_handshake` above returned an error, we never reach this
+    // point: no TUN is created and no relay thread starts.
+    let tun_device = tun::create_device(
+        tun::CLIENT_TUN_NAME,
+        tun::CLIENT_TUN_ADDRESS,
+        tun::VPN_TUN_NETMASK,
+    )?;
+    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
+    println!(
+        "Client TUN '{}' is up at {a}.{b}.{c}.{d}/24",
+        tun::CLIENT_TUN_NAME
+    );
 
     let (tun_reader, tun_writer) = tun_device.split();
     let upload_socket = socket.try_clone()?;

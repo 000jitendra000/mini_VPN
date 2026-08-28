@@ -131,68 +131,29 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
 }
 
 /// Bind a UDP socket on `bind_address`, load the pre-shared key from
-/// `config_path`, create the server TUN interface, and relay raw IP
-/// packets between the TUN device and the socket in both directions,
-/// concurrently -- but only after a peer completes a PSK-authenticated
-/// handshake (see the module docs and `handle_incoming_datagram`).
+/// `config_path`, and wait for a peer to complete the PSK-authenticated
+/// handshake (see the module docs and `handle_incoming_datagram`) before
+/// creating the server TUN interface or relaying anything.
 ///
 /// UDP is connectionless, so there's no "accept" step in the TCP sense;
 /// instead, the server's receive loop doubles as the handshake responder.
 /// Only one client (in progress or established) is supported at a time.
+/// The TUN interface and the TUN->UDP upload thread are created only
+/// once `handle_incoming_datagram` reports `ServerAction::EstablishSession`
+/// -- see `run_server_receive_loop`.
 pub fn run_udp_vpn(bind_address: &str, config_path: &str) -> io::Result<()> {
     let psk = load_psk(config_path)?;
 
     let socket = UdpSocket::bind(bind_address)?;
     println!("VPN UDP server listening on {bind_address}");
 
-    let tun_device = tun::create_device(
-        tun::SERVER_TUN_NAME,
-        tun::SERVER_TUN_ADDRESS,
-        tun::VPN_TUN_NETMASK,
-    )?;
-    let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
-    println!(
-        "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
-        tun::SERVER_TUN_NAME
-    );
-
-    let (tun_reader, tun_writer) = tun_device.split();
-    let upload_socket = socket.try_clone()?;
-
-    // Shared with the upload thread: the currently established (peer,
-    // send cipher), or None until a handshake completes. This is
-    // deliberately a simpler, separate cell from `ServerSession` below --
-    // the upload side only ever needs to ask "is there someone to send
-    // to right now, and with which key", not the richer in-progress
-    // handshake state.
+    // Shared with the upload thread once it exists: the currently
+    // established (peer, send cipher). Created up front (empty) since
+    // `run_server_receive_loop` needs somewhere to put it once a session
+    // is established; the upload thread itself isn't spawned until then.
     let established: Arc<Mutex<transport::EstablishedPeer>> = Arc::new(Mutex::new(None));
-    let upload_established = Arc::clone(&established);
 
-    // Thread: TUN -> UDP (packets captured from the server's TUN device
-    // are framed, encrypted, and sent to the current session's peer, if
-    // any).
-    let upload_thread = thread::spawn(move || {
-        transport::relay_tun_to_udp_established(
-            tun_reader,
-            &upload_socket,
-            "Server",
-            upload_established,
-            crypto::Direction::ServerToClient,
-        )
-    });
-
-    // Main thread: the handshake responder AND the established-session
-    // receiver, combined -- see `handle_incoming_datagram`. Every
-    // datagram that arrives on this socket passes through here first.
-    let download_result = run_server_receive_loop(&socket, &established, &psk, tun_writer);
-
-    match upload_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
-        Err(_) => eprintln!("Server TUN->UDP thread panicked"),
-    }
-
-    download_result
+    run_server_receive_loop(&socket, &established, &psk)
 }
 
 /// The server's session state machine. Exactly one session (in progress
@@ -397,16 +358,29 @@ fn handle_incoming_datagram(
 
 /// The server's UDP receive loop: read a datagram, decide what to do via
 /// `handle_incoming_datagram`, then perform the resulting I/O.
+/// The server's UDP receive loop: read a datagram, decide what to do via
+/// `handle_incoming_datagram`, then perform the resulting I/O.
+///
+/// The TUN interface and the TUN->UDP upload thread do not exist until
+/// the handshake completes: this loop creates both, right here, the
+/// first (and only, given the one-client-only policy) time
+/// `handle_incoming_datagram` returns `ServerAction::EstablishSession`.
+/// Before that point, only handshake messages are ever handled -- there
+/// is no TUN device and no upload thread yet to route data to.
 fn run_server_receive_loop(
     socket: &UdpSocket,
     established: &Arc<Mutex<transport::EstablishedPeer>>,
     psk: &[u8; crypto::KEY_SIZE],
-    mut tun_writer: tun::PacketWriter,
 ) -> io::Result<()> {
     let mut session = ServerSession::NoSession;
     let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
 
-    loop {
+    // Neither exists until the handshake completes (see
+    // `ServerAction::EstablishSession` below).
+    let mut tun_writer: Option<tun::PacketWriter> = None;
+    let mut upload_thread: Option<thread::JoinHandle<io::Result<()>>> = None;
+
+    let loop_result: io::Result<()> = (|| loop {
         let (n, sender) = socket.recv_from(&mut buf)?;
         let action = handle_incoming_datagram(&mut session, sender, &buf[..n], psk);
 
@@ -416,13 +390,62 @@ fn run_server_receive_loop(
             }
             ServerAction::EstablishSession(peer, server_to_client) => {
                 *established.lock().unwrap() = Some((peer, server_to_client));
+
+                // Only now -- after the handshake has fully authenticated
+                // this peer -- do we create the TUN interface and start
+                // relaying. If TUN creation fails here, that failure
+                // propagates out of this loop exactly like any other I/O
+                // error below.
+                let tun_device = tun::create_device(
+                    tun::SERVER_TUN_NAME,
+                    tun::SERVER_TUN_ADDRESS,
+                    tun::VPN_TUN_NETMASK,
+                )?;
+                let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
+                println!(
+                    "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
+                    tun::SERVER_TUN_NAME
+                );
+
+                let (tun_reader, writer) = tun_device.split();
+                tun_writer = Some(writer);
+
+                let upload_socket = socket.try_clone()?;
+                let upload_established = Arc::clone(established);
+                upload_thread = Some(thread::spawn(move || {
+                    transport::relay_tun_to_udp_established(
+                        tun_reader,
+                        &upload_socket,
+                        "Server",
+                        upload_established,
+                        crypto::Direction::ServerToClient,
+                    )
+                }));
             }
-            ServerAction::WriteToTun(payload) => {
-                tun_writer.write_all(&payload)?;
-            }
+            ServerAction::WriteToTun(payload) => match &mut tun_writer {
+                Some(writer) => writer.write_all(&payload)?,
+                None => {
+                    // Should not happen: `handle_incoming_datagram` only
+                    // returns `WriteToTun` once `session` is
+                    // `Established`, which is only reached via the
+                    // `EstablishSession` arm above, which always creates
+                    // `tun_writer` before returning. Defensive-only.
+                    eprintln!("Server: dropping decrypted packet: TUN not ready yet");
+                }
+            },
             ServerAction::Drop => {}
         }
+    })();
+
+    if let Some(handle) = upload_thread {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
+            Err(_) => eprintln!("Server TUN->UDP thread panicked"),
+        }
     }
+
+    loop_result
 }
 
 #[cfg(test)]
@@ -786,5 +809,76 @@ mod tests {
         assert!(matches!(action, ServerAction::Drop));
         // The existing session must remain untouched.
         assert!(matches!(session, ServerSession::Established { peer: p, .. } if p == peer));
+    }
+
+    /// v0.7 correction: the server must not create the TUN interface (or
+    /// its upload thread) until the handshake has actually established a
+    /// session. `handle_incoming_datagram` itself has no TUN dependency,
+    /// so we can verify the *ordering guarantee* purely at the action
+    /// level, with no real TUN device: `EstablishSession` must always be
+    /// the action that authorizes TUN creation in the caller
+    /// (`run_server_receive_loop`), and no `WriteToTun` action can ever
+    /// be produced before that has happened for the current session.
+    #[test]
+    fn establish_session_action_precedes_any_write_to_tun_action() {
+        let psk = test_psk(0x0E);
+        let peer = addr(17);
+        let mut session = ServerSession::NoSession;
+
+        // Before any handshake at all: a plausible EncryptedData datagram
+        // must never produce WriteToTun (there is no session, so no TUN
+        // should exist yet in the real caller either).
+        let fake_envelope = vec![0u8; crypto::COUNTER_SIZE + 32];
+        let datagram = protocol::encode_encrypted_data(&fake_envelope);
+        assert!(!matches!(
+            handle_incoming_datagram(&mut session, peer, &datagram, &psk),
+            ServerAction::WriteToTun(_) | ServerAction::EstablishSession(..)
+        ));
+
+        // Drive Init -> Response.
+        let client_random = crypto::generate_random();
+        let init = protocol::HandshakeMessage::Init {
+            version: protocol::HANDSHAKE_VERSION,
+            client_random,
+        }
+        .encode();
+        let server_random = match handle_incoming_datagram(&mut session, peer, &init, &psk) {
+            ServerAction::Reply(_, bytes) => match protocol::HandshakeMessage::decode(&bytes).unwrap() {
+                protocol::HandshakeMessage::Response { server_random, .. } => server_random,
+                other => panic!("expected Response, got {other:?}"),
+            },
+            other => panic!("expected Reply, got {other:?}"),
+        };
+
+        // Still mid-handshake: still no WriteToTun/EstablishSession yet.
+        assert!(!matches!(
+            handle_incoming_datagram(&mut session, peer, &datagram, &psk),
+            ServerAction::WriteToTun(_) | ServerAction::EstablishSession(..)
+        ));
+
+        // Complete the handshake: THIS is the one and only point where
+        // EstablishSession is produced -- the real server creates the
+        // TUN device and spawns the upload thread exactly here.
+        let client_tag = crypto::handshake_tag(
+            protocol::MSG_TYPE_HANDSHAKE_CONFIRM,
+            protocol::HANDSHAKE_VERSION,
+            &psk,
+            &client_random,
+            &server_random,
+        );
+        let confirm = protocol::HandshakeMessage::Confirm { tag: client_tag }.encode();
+        let action = handle_incoming_datagram(&mut session, peer, &confirm, &psk);
+        assert!(matches!(action, ServerAction::EstablishSession(p, _) if p == peer));
+
+        // Only now, after EstablishSession, can a real EncryptedData
+        // packet from the established peer produce WriteToTun.
+        let session_ciphers = crypto::derive_session_ciphers(&psk, &client_random, &server_random);
+        let frame = protocol::Frame::data(vec![0xAB; 10]).unwrap();
+        let envelope = session_ciphers
+            .client_to_server
+            .encrypt(crypto::Direction::ClientToServer, &frame.encode());
+        let data_datagram = protocol::encode_encrypted_data(&envelope);
+        let action = handle_incoming_datagram(&mut session, peer, &data_datagram, &psk);
+        assert!(matches!(action, ServerAction::WriteToTun(ref payload) if *payload == vec![0xAB; 10]));
     }
 }
