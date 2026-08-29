@@ -1,14 +1,33 @@
-# Server config file (new in v0.6).
+# Server config file (new in v0.6; [routing] added in v0.8).
 #
 # [crypto] is the pre-shared key used for ChaCha20-Poly1305 encryption by
-# \`udp-server\`. This MUST match the [crypto] key in config/client.toml,
+# `udp-server`. This MUST match the [crypto] key in config/client.toml,
 # or the server will fail to authenticate every packet from the client
 # (and vice versa) -- see the wrong-key test in the v0.6 writeup.
 #
-# WARNING: this default key is committed to the repo purely so the v0.6
-# demo works out of the box. Never do this for a real deployment --
-# generate your own key (e.g. \`openssl rand -hex 32\`) and keep it out of
-# version control.
+# WARNING: this default key is committed to the repo purely so the demo
+# works out of the box. Never do this for a real deployment -- generate
+# your own key (e.g. `openssl rand -hex 32`) and keep it out of version
+# control.
 
 [crypto]
-key = "2e2be72ff8bfebda19ce83587584352b7e950ab323236f72e13ad9023a0711f6"
+key = "3f1f82e5f7f5a71180a8d9232ce1053a4fdb5b69c7723f84efe7ceb43d480d97"
+
+# [routing] controls whether `udp-server` configures this host as a VPN
+# gateway (IP forwarding + NAT/MASQUERADE) once a client's session is
+# established. Requires root (or CAP_NET_ADMIN + CAP_NET_RAW) and the
+# `iptables` command to be installed. See README.md for what this
+# actually does and how to inspect/verify it.
+[routing]
+# Set to false to keep the older, tunnel-only behavior: the encrypted
+# tunnel between client and server TUN interfaces still works, but this
+# server will not forward VPN traffic anywhere else or provide Internet
+# access. Defaults to true if this key (or the whole [routing] section)
+# is absent.
+nat_enabled = true
+
+# Which interface to NAT/forward through. If omitted (or commented out),
+# it's auto-detected from the host's default route (`ip route show
+# default`). Uncomment and set this explicitly if auto-detection picks
+# the wrong interface, or if the host has no default route.
+# outbound_interface = "eth0"

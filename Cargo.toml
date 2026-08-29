@@ -1,6 +1,6 @@
 [package]
 name = "tiny-vpn"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
@@ -21,3 +21,9 @@ sha2 = "0.10"
 # poly1305/universal-hash chain); declared directly here because our own
 # code now uses it too.
 subtle = "2.6"
+# v0.8: was already a transitive dependency (the `tun` crate's Linux
+# backend uses it for ioctl calls). Declared directly here because
+# `src/routing/linux.rs` now also uses it, for a minimal SIGINT handler
+# that lets the server's RAII routing/NAT cleanup run on Ctrl+C instead
+# of the process just dying mid-configuration (see routing/linux.rs).
+libc = "0.2"

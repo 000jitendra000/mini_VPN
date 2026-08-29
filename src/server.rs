@@ -10,15 +10,24 @@
 //! and relays raw IP packets between the TUN device and a TCP connection,
 //! in both directions, concurrently.
 //!
-//! `run_udp_vpn()` is v0.4/v0.6/v0.7: UDP transport, encrypted, and (as of
-//! v0.7) session-based: the server no longer trusts a peer just because a
-//! packet from them decrypted correctly under a static key. Instead, a
-//! peer must first complete a PSK-authenticated handshake
+//! `run_udp_vpn()` is v0.4/v0.6/v0.7/v0.8: UDP transport, encrypted, and
+//! (as of v0.7) session-based: the server no longer trusts a peer just
+//! because a packet from them decrypted correctly under a static key.
+//! Instead, a peer must first complete a PSK-authenticated handshake
 //! (`HandshakeInit` -> `HandshakeResponse` -> `HandshakeConfirm`; see
 //! `protocol.rs`/`crypto.rs`) that derives fresh, per-session encryption
 //! keys before any `EncryptedData` from them is accepted. Only one
 //! session (in progress or established) is tracked at a time -- there is
 //! still no client table.
+//!
+//! As of v0.8, once a session is established (and the TUN interface is
+//! up), the server also configures the host to act as a gateway for the
+//! VPN subnet -- IP forwarding and NAT/MASQUERADE, via `routing.rs` --
+//! before it starts relaying data. That configuration is held behind an
+//! RAII guard, so it's automatically undone (forwarding sysctl restored,
+//! NAT/forward rules removed) when the server shuts down, whether that's
+//! because of an error or a clean Ctrl+C (SIGINT is specifically handled
+//! so this cleanup runs -- see `routing::install_shutdown_handler`).
 //!
 //! The handshake/session state machine (`ServerSession`,
 //! `handle_incoming_datagram`) is written as a pure function with no
@@ -34,6 +43,7 @@ use std::thread;
 use crate::config;
 use crate::crypto::{self, Cipher};
 use crate::protocol;
+use crate::routing;
 use crate::transport;
 use crate::tun;
 
@@ -143,9 +153,32 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
 /// -- see `run_server_receive_loop`.
 pub fn run_udp_vpn(bind_address: &str, config_path: &str) -> io::Result<()> {
     let psk = load_psk(config_path)?;
+    let routing_settings = config::load_routing_settings(config_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    // Safe to install unconditionally: this only affects process signal
+    // handling (letting a blocking recv return with Interrupted on
+    // Ctrl+C so our RAII cleanup runs), not any networking state, and is
+    // just as valid when routing/NAT is disabled (nothing to clean up
+    // beyond the TUN device, which the OS removes on process exit
+    // regardless).
+    routing::install_shutdown_handler();
 
     let socket = UdpSocket::bind(bind_address)?;
     println!("VPN UDP server listening on {bind_address}");
+
+    if routing_settings.nat_enabled {
+        println!(
+            "Server: routing/NAT will be configured once a session is established \
+             (outbound interface: {})",
+            routing_settings
+                .outbound_interface
+                .as_deref()
+                .unwrap_or("auto-detect")
+        );
+    } else {
+        println!("Server: routing/NAT is disabled (tunnel-only mode; no Internet access via this server)");
+    }
 
     // Shared with the upload thread once it exists: the currently
     // established (peer, send cipher). Created up front (empty) since
@@ -153,7 +186,7 @@ pub fn run_udp_vpn(bind_address: &str, config_path: &str) -> io::Result<()> {
     // is established; the upload thread itself isn't spawned until then.
     let established: Arc<Mutex<transport::EstablishedPeer>> = Arc::new(Mutex::new(None));
 
-    run_server_receive_loop(&socket, &established, &psk)
+    run_server_receive_loop(&socket, &established, &psk, &routing_settings)
 }
 
 /// The server's session state machine. Exactly one session (in progress
@@ -358,30 +391,50 @@ fn handle_incoming_datagram(
 
 /// The server's UDP receive loop: read a datagram, decide what to do via
 /// `handle_incoming_datagram`, then perform the resulting I/O.
-/// The server's UDP receive loop: read a datagram, decide what to do via
-/// `handle_incoming_datagram`, then perform the resulting I/O.
 ///
-/// The TUN interface and the TUN->UDP upload thread do not exist until
-/// the handshake completes: this loop creates both, right here, the
-/// first (and only, given the one-client-only policy) time
-/// `handle_incoming_datagram` returns `ServerAction::EstablishSession`.
-/// Before that point, only handshake messages are ever handled -- there
-/// is no TUN device and no upload thread yet to route data to.
+/// The TUN interface, the TUN->UDP upload thread, and (if
+/// `routing_settings.nat_enabled`) the host's forwarding/NAT
+/// configuration do not exist until the handshake completes: this loop
+/// creates all three, right here, the first (and only, given the
+/// one-client-only policy) time `handle_incoming_datagram` returns
+/// `ServerAction::EstablishSession`. Before that point, only handshake
+/// messages are ever handled -- there is no TUN device, no upload
+/// thread, and no routing/NAT state yet to route data through.
+///
+/// A `SIGINT` (Ctrl+C) interrupts the blocking `recv_from` below with
+/// `io::ErrorKind::Interrupted` (see `routing::install_shutdown_handler`)
+/// rather than killing the process outright, so this function can notice
+/// it, return `Ok(())`, and let its local RAII guards (`routing_guard`,
+/// and the upload-thread join below) run their cleanup.
 fn run_server_receive_loop(
     socket: &UdpSocket,
     established: &Arc<Mutex<transport::EstablishedPeer>>,
     psk: &[u8; crypto::KEY_SIZE],
+    routing_settings: &config::RoutingSettings,
 ) -> io::Result<()> {
     let mut session = ServerSession::NoSession;
     let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
 
-    // Neither exists until the handshake completes (see
-    // `ServerAction::EstablishSession` below).
+    // None of these exist until the handshake completes (see
+    // `ServerAction::EstablishSession` below). `routing_guard` is only
+    // ever set if `routing_settings.nat_enabled`; dropping it (when this
+    // function returns) restores the host's forwarding/NAT state.
     let mut tun_writer: Option<tun::PacketWriter> = None;
     let mut upload_thread: Option<thread::JoinHandle<io::Result<()>>> = None;
+    let mut routing_guard: Option<routing::RoutingGuard> = None;
 
     let loop_result: io::Result<()> = (|| loop {
-        let (n, sender) = socket.recv_from(&mut buf)?;
+        let (n, sender) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
+                println!("Server: shutdown requested, cleaning up");
+                return Ok(());
+            }
+            // A spurious/unrelated EINTR (not our shutdown signal): just
+            // retry the read instead of treating it as a hard error.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         let action = handle_incoming_datagram(&mut session, sender, &buf[..n], psk);
 
         match action {
@@ -406,6 +459,25 @@ fn run_server_receive_loop(
                     "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
                     tun::SERVER_TUN_NAME
                 );
+
+                // Only now -- after the TUN interface exists -- do we
+                // configure the host as a gateway for the VPN subnet.
+                // Not enabling forwarding/NAT before the authenticated
+                // session exists (or before its TUN interface exists) is
+                // deliberate: there is nothing to forward or NAT for
+                // until this point anyway, and configuring it earlier
+                // would have no VPN-side counterpart to justify it.
+                if routing_settings.nat_enabled {
+                    let routing_config = routing::RoutingConfig {
+                        vpn_subnet: routing::cidr_from_address_and_netmask(
+                            tun::SERVER_TUN_ADDRESS,
+                            tun::VPN_TUN_NETMASK,
+                        ),
+                        tun_interface: tun::SERVER_TUN_NAME.to_string(),
+                        outbound_interface: routing_settings.outbound_interface.clone(),
+                    };
+                    routing_guard = Some(routing::apply(&routing_config)?);
+                }
 
                 let (tun_reader, writer) = tun_device.split();
                 tun_writer = Some(writer);
@@ -438,12 +510,31 @@ fn run_server_receive_loop(
     })();
 
     if let Some(handle) = upload_thread {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
-            Err(_) => eprintln!("Server TUN->UDP thread panicked"),
+        if loop_result.is_ok() {
+            // Clean shutdown (the only way `loop_result` is `Ok(())` is
+            // via the SIGINT path above): deliberately do NOT block
+            // waiting for the upload thread here. A signal delivered to
+            // this process is handled by whichever thread the kernel
+            // picks -- not necessarily the upload thread, which is
+            // blocked in its own TUN read -- so `handle.join()` could
+            // hang indefinitely, and with it, the routing/NAT cleanup
+            // below that a hung shutdown would never reach. The process
+            // is about to exit right after this function returns; the OS
+            // reclaims the abandoned thread's TUN fd and UDP socket the
+            // same way it always has when this project's processes exit.
+            drop(handle);
+        } else {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
+                Err(_) => eprintln!("Server TUN->UDP thread panicked"),
+            }
         }
     }
+
+    // `routing_guard` drops here (restoring forwarding/NAT state) as this
+    // function returns, whether `loop_result` is `Ok` or `Err`.
+    drop(routing_guard);
 
     loop_result
 }

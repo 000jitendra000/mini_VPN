@@ -1,19 +1,21 @@
-//! Minimal config-file loading (v0.6).
+//! Minimal config-file loading (v0.6, extended in v0.8 for routing/NAT
+//! settings).
 //!
-//! Just enough hand-written parsing to read a `[crypto]` section's `key`
-//! entry out of a TOML-flavored config file, without adding a TOML/serde
-//! dependency (none is needed for something this small).
+//! Just enough hand-written parsing to read `[section] key = value`
+//! entries out of a TOML-flavored config file, without adding a
+//! TOML/serde dependency (none is needed for something this small).
 //!
 //! This is intentionally NOT a general TOML parser: it understands only
-//! `[section]` headers and `key = "quoted value"` lines within a section,
-//! skips blank lines and `#` comments, and ignores every section except
-//! `[crypto]`. That covers everything this project's config files need
-//! right now. If a real TOML parser is ever warranted, it should replace
-//! this rather than grow it.
+//! `[section]` headers and `key = value` lines within a section (with an
+//! optional surrounding pair of double quotes on the value), skips blank
+//! lines and `#` comments, and only ever looks inside the one section a
+//! caller asks for. That covers everything this project's config files
+//! need right now. If a real TOML parser is ever warranted, it should
+//! replace this rather than grow it.
 //!
-//! This module only extracts the raw hex string from config; it does not
-//! validate it as key bytes or touch any cryptographic code -- see
-//! `crypto::parse_key_hex` for that.
+//! This module only extracts raw strings from config; it does not
+//! validate key bytes (see `crypto::parse_key_hex`) or touch any
+//! networking code (see `routing.rs`) itself.
 
 use std::fmt;
 use std::fs;
@@ -25,6 +27,10 @@ pub enum ConfigError {
     Io(io::Error),
     MissingCryptoSection,
     MissingKey,
+    /// A `[routing]` value was present but not one of the values that key
+    /// accepts (currently only `nat_enabled`, which must be `true` or
+    /// `false`).
+    InvalidRoutingValue { key: &'static str, found: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -33,6 +39,9 @@ impl fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "could not read config file: {e}"),
             ConfigError::MissingCryptoSection => write!(f, "config file has no [crypto] section"),
             ConfigError::MissingKey => write!(f, "[crypto] section has no 'key' entry"),
+            ConfigError::InvalidRoutingValue { key, found } => {
+                write!(f, "[routing] '{key}' has an invalid value: {found:?} (expected \"true\" or \"false\")")
+            }
         }
     }
 }
@@ -45,14 +54,12 @@ impl From<io::Error> for ConfigError {
     }
 }
 
-/// Load the `[crypto] key = "..."` value from a config file at `path`,
-/// returning the raw hex string exactly as written (not yet parsed or
-/// validated as key bytes).
-pub fn load_crypto_key_hex(path: &str) -> Result<String, ConfigError> {
-    let contents = fs::read_to_string(path)?;
-
-    let mut in_crypto_section = false;
-    let mut found_crypto_section = false;
+/// Scan `contents` for a `[section]` header followed by a `key = value`
+/// line, and return the value (unquoted, if it was a quoted string).
+/// Shared by every `load_*` function below so there's exactly one place
+/// that understands this project's tiny config-file dialect.
+fn find_value(contents: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -61,35 +68,107 @@ pub fn load_crypto_key_hex(path: &str) -> Result<String, ConfigError> {
             continue;
         }
 
-        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            in_crypto_section = section.trim() == "crypto";
-            if in_crypto_section {
-                found_crypto_section = true;
-            }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_section = name.trim() == section;
             continue;
         }
 
-        if !in_crypto_section {
+        if !in_section {
             continue;
         }
 
-        if let Some((name, value)) = line.split_once('=') {
-            if name.trim() == "key" {
+        if let Some((found_key, value)) = line.split_once('=') {
+            if found_key.trim() == key {
                 let value = value.trim();
                 let unquoted = value
                     .strip_prefix('"')
                     .and_then(|v| v.strip_suffix('"'))
                     .unwrap_or(value);
-                return Ok(unquoted.to_string());
+                return Some(unquoted.to_string());
             }
         }
     }
 
-    if found_crypto_section {
-        Err(ConfigError::MissingKey)
-    } else {
-        Err(ConfigError::MissingCryptoSection)
+    None
+}
+
+/// Whether `contents` contains a `[section]` header at all (used to
+/// distinguish "section missing" from "key missing within the section"
+/// for clearer error messages).
+fn has_section(contents: &str, section: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim().strip_prefix('[').and_then(|s| s.strip_suffix(']')) == Some(section))
+}
+
+/// Load the `[crypto] key = "..."` value from a config file at `path`,
+/// returning the raw hex string exactly as written (not yet parsed or
+/// validated as key bytes -- see `crypto::parse_key_hex` for that).
+pub fn load_crypto_key_hex(path: &str) -> Result<String, ConfigError> {
+    let contents = fs::read_to_string(path)?;
+
+    match find_value(&contents, "crypto", "key") {
+        Some(value) => Ok(value),
+        None if has_section(&contents, "crypto") => Err(ConfigError::MissingKey),
+        None => Err(ConfigError::MissingCryptoSection),
     }
+}
+
+/// Routing/NAT settings loaded from a server config file's `[routing]`
+/// section. See `routing::RoutingConfig` for how this feeds into the
+/// actual platform backend -- this type only carries what config files
+/// can express; it does not know anything about iptables or TUN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingSettings {
+    /// Whether the server should configure IP forwarding/NAT at all.
+    /// Defaults to `true` if the `[routing]` section or this key is
+    /// absent -- v0.8's whole point is to make the tunnel act as a
+    /// gateway by default; set this to `false` to keep the older,
+    /// tunnel-only (no Internet access) behavior instead.
+    pub nat_enabled: bool,
+    /// Outbound interface to forward/NAT through. `None` means
+    /// "auto-detect from the host's default route" (the default when
+    /// this key is absent).
+    pub outbound_interface: Option<String>,
+}
+
+impl Default for RoutingSettings {
+    fn default() -> Self {
+        RoutingSettings {
+            nat_enabled: true,
+            outbound_interface: None,
+        }
+    }
+}
+
+/// Load the `[routing]` section from a config file at `path`. A totally
+/// absent `[routing]` section (or an absent individual key within it) is
+/// not an error -- it just means "use the default" (see
+/// `RoutingSettings::default`), since routing/NAT configuration is
+/// optional, unlike the `[crypto]` key.
+pub fn load_routing_settings(path: &str) -> Result<RoutingSettings, ConfigError> {
+    let contents = fs::read_to_string(path)?;
+
+    let nat_enabled = match find_value(&contents, "routing", "nat_enabled") {
+        Some(value) => match value.as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(ConfigError::InvalidRoutingValue {
+                    key: "nat_enabled",
+                    found: other.to_string(),
+                })
+            }
+        },
+        None => RoutingSettings::default().nat_enabled,
+    };
+
+    let outbound_interface = find_value(&contents, "routing", "outbound_interface");
+
+    Ok(RoutingSettings {
+        nat_enabled,
+        outbound_interface,
+    })
 }
 
 #[cfg(test)]
@@ -157,5 +236,59 @@ mod tests {
             Err(ConfigError::Io(_)) => {}
             other => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.8 [routing] section tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn routing_settings_default_when_section_absent() {
+        let path = write_temp_config("[crypto]\nkey = \"deadbeef\"\n");
+        let settings = load_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings, RoutingSettings::default());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn routing_settings_parses_explicit_values() {
+        let path = write_temp_config(
+            "[routing]\nnat_enabled = false\noutbound_interface = \"eth0\"\n",
+        );
+        let settings = load_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            settings,
+            RoutingSettings {
+                nat_enabled: false,
+                outbound_interface: Some("eth0".to_string()),
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn routing_settings_nat_enabled_defaults_true_when_key_absent() {
+        let path = write_temp_config("[routing]\noutbound_interface = \"eth0\"\n");
+        let settings = load_routing_settings(path.to_str().unwrap()).unwrap();
+        assert!(settings.nat_enabled);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn routing_settings_outbound_interface_defaults_none_when_absent() {
+        let path = write_temp_config("[routing]\nnat_enabled = true\n");
+        let settings = load_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.outbound_interface, None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn routing_settings_invalid_nat_enabled_value_is_rejected() {
+        let path = write_temp_config("[routing]\nnat_enabled = maybe\n");
+        match load_routing_settings(path.to_str().unwrap()) {
+            Err(ConfigError::InvalidRoutingValue { key: "nat_enabled", .. }) => {}
+            other => panic!("expected InvalidRoutingValue, got {other:?}"),
+        }
+        let _ = fs::remove_file(path);
     }
 }
