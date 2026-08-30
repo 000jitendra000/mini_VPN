@@ -301,7 +301,7 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
 pub fn install_shutdown_handler() {
     unsafe {
         let mut action: libc::sigaction = mem::zeroed();
-        action.sa_sigaction = handle_sigint as usize;
+        action.sa_sigaction = handle_sigint as *const () as usize;
         action.sa_flags = 0; // deliberately not SA_RESTART
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
@@ -312,6 +312,227 @@ pub fn install_shutdown_handler() {
 /// `install_shutdown_handler` was called.
 pub fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+// ============================================================================
+// v0.8.5: client-side routing.
+// ============================================================================
+
+/// RAII handle: on drop, removes exactly the routes the corresponding
+/// `apply_client_routes` call added, in reverse order.
+pub struct ClientRouteGuard {
+    added_route_deletions: Vec<Vec<String>>,
+}
+
+impl Drop for ClientRouteGuard {
+    fn drop(&mut self) {
+        for delete_args in self.added_route_deletions.iter().rev() {
+            let args: Vec<&str> = delete_args.iter().map(String::as_str).collect();
+            if let Err(e) = run_ip(&args) {
+                eprintln!("Client: failed to remove route during cleanup: {e}");
+            }
+        }
+        if !self.added_route_deletions.is_empty() {
+            println!("Client: routing table restored to its pre-VPN state");
+        }
+    }
+}
+
+/// Add every route in `plan`, returning a guard that removes them when
+/// dropped. If any route fails to add, every route already added by this
+/// call is removed (in reverse order) before the error is returned --
+/// this never leaves the client's routing table half-configured.
+pub fn apply_client_routes(plan: &super::ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
+    let mut added_route_deletions: Vec<Vec<String>> = Vec::new();
+
+    for route in &plan.routes {
+        let add_args = route_args("add", route);
+        let add_refs: Vec<&str> = add_args.iter().map(String::as_str).collect();
+        if let Err(e) = run_ip(&add_refs) {
+            for already_added in added_route_deletions.iter().rev() {
+                let refs: Vec<&str> = already_added.iter().map(String::as_str).collect();
+                let _ = run_ip(&refs);
+            }
+            return Err(e);
+        }
+        println!(
+            "Client: route added: {} via {}",
+            route.destination,
+            describe_via(&route.via)
+        );
+        added_route_deletions.push(route_args("del", route));
+    }
+
+    Ok(ClientRouteGuard {
+        added_route_deletions,
+    })
+}
+
+fn describe_via(via: &super::RouteVia) -> String {
+    match via {
+        super::RouteVia::Device(dev) => format!("dev {dev}"),
+        super::RouteVia::Gateway { gateway, device } => format!("via {gateway} dev {device}"),
+    }
+}
+
+/// Build the `ip route <action> <destination> [via <gw>] dev <dev>`
+/// argument list for one route.
+fn route_args(action: &str, route: &super::ClientRoute) -> Vec<String> {
+    let mut args = vec!["route".to_string(), action.to_string(), route.destination.clone()];
+    match &route.via {
+        super::RouteVia::Device(device) => {
+            args.push("dev".to_string());
+            args.push(device.clone());
+        }
+        super::RouteVia::Gateway { gateway, device } => {
+            args.push("via".to_string());
+            args.push(gateway.clone());
+            args.push("dev".to_string());
+            args.push(device.clone());
+        }
+    }
+    args
+}
+
+/// Run `ip` with `args`, returning a clear error (including `ip`'s own
+/// stderr) on any failure.
+fn run_ip(args: &[&str]) -> io::Result<()> {
+    let output = Command::new("ip").args(args).output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to run ip (is it installed, and are you root?): {e}"),
+        )
+    })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ip {args:?} failed: {}", stderr.trim()),
+        ))
+    }
+}
+
+/// Determine how the host currently reaches `ip` (an IPv4 address, no
+/// port), by parsing `ip route get <ip>` -- e.g. `<ip> via <gateway> dev
+/// <iface> src <src> ...` or, for a directly-connected/local address,
+/// `<ip> dev <iface> src <src> ...` (no `via`). Must be called *before*
+/// any client VPN routes are added, so it captures the host's genuine
+/// pre-VPN route to the server -- see `build_client_routing_plan`.
+pub fn current_route_to(ip: &str) -> io::Result<super::RouteVia> {
+    let output = Command::new("ip")
+        .args(["route", "get", ip])
+        .output()
+        .map_err(|e| io::Error::new(e.kind(), format!("failed to run 'ip route get {ip}': {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("'ip route get {ip}' failed: {}", stderr.trim()),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let tokens: Vec<&str> = stdout.split_whitespace().collect();
+
+    let mut gateway = None;
+    let mut device = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "via" => {
+                gateway = tokens.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "dev" => {
+                device = tokens.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let device = device.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("could not determine device for the route to {ip} (output was: {stdout:?})"),
+        )
+    })?;
+
+    Ok(match gateway {
+        Some(gateway) => super::RouteVia::Gateway { gateway, device },
+        None => super::RouteVia::Device(device),
+    })
+}
+
+#[cfg(test)]
+mod client_routing_tests {
+    use super::*;
+
+    // Only genuinely read-only/non-destructive checks belong here -- see
+    // the note at the top of the `tests` module above. Anything that
+    // would actually add/remove a real route is deliberately NOT an
+    // automated `cargo test`; see the v0.8.5 report for the separate,
+    // deliberate, manual root-run integration test that covers that.
+
+    #[test]
+    fn route_args_device_form() {
+        let route = super::super::ClientRoute {
+            destination: "10.20.0.0/24".to_string(),
+            via: super::super::RouteVia::Device("tiny-tun-client".to_string()),
+        };
+        let add = route_args("add", &route);
+        let del = route_args("del", &route);
+        assert_eq!(
+            add,
+            vec!["route", "add", "10.20.0.0/24", "dev", "tiny-tun-client"]
+        );
+        assert_eq!(
+            del,
+            vec!["route", "del", "10.20.0.0/24", "dev", "tiny-tun-client"]
+        );
+    }
+
+    #[test]
+    fn route_args_gateway_form() {
+        let route = super::super::ClientRoute {
+            destination: "203.0.113.10/32".to_string(),
+            via: super::super::RouteVia::Gateway {
+                gateway: "192.0.2.1".to_string(),
+                device: "eth0".to_string(),
+            },
+        };
+        let add = route_args("add", &route);
+        assert_eq!(
+            add,
+            vec![
+                "route",
+                "add",
+                "203.0.113.10/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "eth0"
+            ]
+        );
+    }
+
+    #[test]
+    fn current_route_to_parses_a_real_host_route() {
+        // Read-only (`ip route get`); does not modify the host. Every
+        // Linux host can route to its own loopback address, so this is
+        // safe to run anywhere `cargo test` runs.
+        match current_route_to("127.0.0.1") {
+            Ok(via) => {
+                // Loopback is a local/device route: no gateway.
+                assert!(matches!(via, super::super::RouteVia::Device(_)));
+            }
+            Err(_) => {} // extremely unusual environment; not a hard failure
+        }
+    }
 }
 
 #[cfg(test)]

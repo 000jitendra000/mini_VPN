@@ -1,6 +1,7 @@
 //! TCP byte-tunnel client (v0.1) and VPN client (v0.3, extended in v0.4
-//! with UDP transport, in v0.6 with encryption, and in v0.7 with a
-//! PSK-authenticated handshake and per-session keys).
+//! with UDP transport, in v0.6 with encryption, in v0.7 with a
+//! PSK-authenticated handshake and per-session keys, and in v0.8.5 with
+//! client-side routing).
 //!
 //! `run()` is the original v0.1 mode: it relays stdin -> socket and
 //! socket -> stdout, so the raw byte tunnel can be exercised interactively
@@ -10,20 +11,28 @@
 //! server over TCP, and relays raw IP packets between the two, in both
 //! directions, concurrently.
 //!
-//! `run_udp_vpn()` is v0.4/v0.6/v0.7: the client now performs a
+//! `run_udp_vpn()` is v0.4/v0.6/v0.7/v0.8.5: the client performs a
 //! PSK-authenticated handshake with the server (`perform_handshake`)
 //! before any VPN data flows, deriving fresh per-session encryption keys
 //! instead of using the static PSK directly (see `crypto.rs`). Only after
-//! that succeeds does it create the TUN interface and start relaying.
+//! that succeeds does it create the TUN interface; only after THAT does
+//! it (optionally, per `[routing]` in config) configure client-side
+//! routing (`configure_client_routing`) -- split-tunnel (selected CIDRs)
+//! or full-tunnel (all IPv4 traffic, except the VPN server's own
+//! endpoint, which always keeps using the client's normal physical
+//! route -- see `routing::build_client_routing_plan`). Routing defaults
+//! to disabled: installing v0.8.5 does not by itself change any existing
+//! client's routing behavior.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpStream, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
-use crate::config;
+use crate::config::{self, RoutingMode};
 use crate::crypto::{self, SessionCiphers};
 use crate::protocol;
+use crate::routing;
 use crate::transport;
 use crate::tun;
 
@@ -238,11 +247,29 @@ fn perform_handshake(socket: &UdpSocket, psk: &[u8; crypto::KEY_SIZE]) -> io::Re
 /// and the socket in both directions, concurrently, using the
 /// freshly-derived per-session keys.
 ///
+/// As of v0.8.5, once the TUN interface exists, `[routing]` in the config
+/// file (see `config::load_client_routing_settings`) optionally routes
+/// selected traffic (`mode = "split"`) or all IPv4 traffic except the VPN
+/// server's own endpoint (`mode = "full"`) through that TUN device. With
+/// no `[routing]` section (or `mode = "disabled"`, the default), client
+/// routing behaves exactly as it did before v0.8.5: no route changes at
+/// all beyond the TUN device's own connected route for the VPN subnet.
+///
 /// A VPN data packet that fails authentication (which should only happen
 /// under corruption, since the session key is by now confirmed correct)
 /// is dropped and logged -- never written to TUN.
 pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
     let psk = load_psk(config_path)?;
+    let client_routing_settings = config::load_client_routing_settings(config_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    // Reuses the exact same SIGINT handler/flag the v0.8 server installs
+    // (see routing::install_shutdown_handler) rather than duplicating it:
+    // a plain Ctrl+C would otherwise terminate this process immediately,
+    // skipping `routing_guard`'s cleanup below and leaving client routes
+    // behind. Safe to call unconditionally, including when routing is
+    // disabled -- it only affects process signal handling.
+    routing::install_shutdown_handler();
 
     // Bind to an OS-assigned local port; we only ever talk to one server.
     let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -271,6 +298,13 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
         tun::CLIENT_TUN_NAME
     );
 
+    // Only now -- after the TUN interface exists, and still before any
+    // VPN packet relaying begins -- do we optionally configure client
+    // routing. `socket` is already connected and the handshake already
+    // completed, so changing the routing table here cannot interfere
+    // with either.
+    let routing_guard = configure_client_routing(&client_routing_settings, &socket)?;
+
     let (tun_reader, tun_writer) = tun_device.split();
     let upload_socket = socket.try_clone()?;
 
@@ -298,11 +332,101 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
         crypto::Direction::ServerToClient,
     );
 
-    match upload_thread.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("Client TUN->UDP error: {e}"),
-        Err(_) => eprintln!("Client TUN->UDP thread panicked"),
+    // A SIGINT-interrupted read is a clean shutdown request, not an
+    // error -- see `routing::install_shutdown_handler`.
+    let download_result = match download_result {
+        Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
+            println!("Client: shutdown requested, cleaning up");
+            Ok(())
+        }
+        other => other,
+    };
+
+    match &download_result {
+        Ok(()) => {
+            // Clean shutdown: deliberately do NOT block waiting for the
+            // upload thread here. A signal delivered to this process is
+            // handled by whichever thread the kernel picks -- not
+            // necessarily the upload thread, which is blocked in its own
+            // TUN read -- so `.join()` could hang indefinitely, and with
+            // it, the routing cleanup below that a hung shutdown would
+            // never reach (see the identical v0.8 server-side fix). The
+            // process is about to exit right after this function
+            // returns; the OS reclaims the abandoned thread's TUN fd and
+            // UDP socket the same way it always has.
+            drop(upload_thread);
+        }
+        Err(_) => match upload_thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("Client TUN->UDP error: {e}"),
+            Err(_) => eprintln!("Client TUN->UDP thread panicked"),
+        },
     }
 
+    // `routing_guard` drops here (removing any client routes it added)
+    // as this function returns, whether `download_result` is `Ok` or
+    // `Err`.
+    drop(routing_guard);
+
     download_result
+}
+
+/// Configure client-side routing per `settings`, if enabled. Returns
+/// `None` for `RoutingMode::Disabled` (the default) -- no routes are
+/// touched at all. For `Split`/`Full`, determines the VPN server's
+/// resolved IPv4 endpoint and its pre-VPN route (so the tunnel's own
+/// traffic can never loop back into itself -- see
+/// `routing::build_client_routing_plan`), builds the routing plan, and
+/// applies it, returning a guard that removes the added routes when
+/// dropped.
+///
+/// IPv4 is the only supported case for the VPN server's endpoint in this
+/// milestone: if it resolved to IPv6, this returns an error rather than
+/// silently skipping route configuration or routing the wrong thing.
+fn configure_client_routing(
+    settings: &config::ClientRoutingSettings,
+    socket: &UdpSocket,
+) -> io::Result<Option<routing::ClientRouteGuard>> {
+    if settings.mode == RoutingMode::Disabled {
+        return Ok(None);
+    }
+
+    let server_ip = match socket.peer_addr()?.ip() {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "client routing (split/full) only supports an IPv4 VPN server endpoint \
+                 in this version; the resolved server address is IPv6",
+            ));
+        }
+    };
+    let server_ip_str = server_ip.to_string();
+
+    // Captured BEFORE any client VPN routes exist, so this reflects the
+    // host's genuine pre-VPN route to the server -- exactly what the
+    // server-endpoint exception (full-tunnel mode) needs to pin to.
+    let server_route = routing::current_route_to(&server_ip_str)?;
+
+    let mode = match settings.mode {
+        RoutingMode::Disabled => unreachable!("handled above"),
+        RoutingMode::Split => routing::ClientRoutingMode::Split(settings.routes.clone()),
+        RoutingMode::Full => routing::ClientRoutingMode::Full,
+    };
+
+    let plan = routing::build_client_routing_plan(
+        &mode,
+        tun::CLIENT_TUN_NAME,
+        &server_ip_str,
+        &server_route,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    println!(
+        "Client: routing mode is {mode:?}; VPN server endpoint {server_ip_str} stays on its \
+         existing route"
+    );
+
+    let guard = routing::apply_client_routes(&plan)?;
+    Ok(Some(guard))
 }

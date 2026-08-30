@@ -28,9 +28,12 @@ pub enum ConfigError {
     MissingCryptoSection,
     MissingKey,
     /// A `[routing]` value was present but not one of the values that key
-    /// accepts (currently only `nat_enabled`, which must be `true` or
-    /// `false`).
+    /// accepts (currently `nat_enabled`, which must be `true`/`false`,
+    /// and `mode`, which must be `disabled`/`split`/`full`).
     InvalidRoutingValue { key: &'static str, found: String },
+    /// A `[routing] routes` entry was present but not a `[...]`-bracketed
+    /// list, e.g. `routes = ["10.20.0.0/24"]`.
+    InvalidRouteList { found: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -40,7 +43,13 @@ impl fmt::Display for ConfigError {
             ConfigError::MissingCryptoSection => write!(f, "config file has no [crypto] section"),
             ConfigError::MissingKey => write!(f, "[crypto] section has no 'key' entry"),
             ConfigError::InvalidRoutingValue { key, found } => {
-                write!(f, "[routing] '{key}' has an invalid value: {found:?} (expected \"true\" or \"false\")")
+                write!(f, "[routing] '{key}' has an invalid value: {found:?}")
+            }
+            ConfigError::InvalidRouteList { found } => {
+                write!(
+                    f,
+                    "[routing] 'routes' must be a bracketed list like [\"10.20.0.0/24\"], found: {found:?}"
+                )
             }
         }
     }
@@ -171,6 +180,112 @@ pub fn load_routing_settings(path: &str) -> Result<RoutingSettings, ConfigError>
     })
 }
 
+// ============================================================================
+// v0.8.5: client-side routing settings.
+//
+// These live in the SAME `[routing]` section name as the server's
+// settings above, but with different keys (`mode`, `routes`) -- since
+// they're always read from different files (config/client.toml vs.
+// config/server.toml) in practice, there's no ambiguity, and reusing the
+// section name keeps the config format uniform rather than inventing a
+// second section just for this.
+// ============================================================================
+
+/// The client's routing mode, as read from config. See
+/// `routing::ClientRoutingMode` for what each mode actually does --
+/// this type only exists to represent what a config file can express;
+/// it has no dependency on `routing.rs` or any networking code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingMode {
+    Disabled,
+    Split,
+    Full,
+}
+
+/// Client routing settings loaded from a config file's `[routing]`
+/// section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRoutingSettings {
+    pub mode: RoutingMode,
+    /// Only meaningful when `mode` is `Split`; ignored otherwise.
+    pub routes: Vec<String>,
+}
+
+impl Default for ClientRoutingSettings {
+    /// `Disabled` -- installing v0.8.5 must not silently change an
+    /// existing client's routing behavior. A client config with no
+    /// `[routing]` section at all behaves exactly as it did in v0.7/v0.8:
+    /// only the TUN device's own connected route for the VPN subnet
+    /// exists.
+    fn default() -> Self {
+        ClientRoutingSettings {
+            mode: RoutingMode::Disabled,
+            routes: vec![],
+        }
+    }
+}
+
+/// Load the `[routing]` section from a client config file at `path`. A
+/// totally absent `[routing]` section (or an absent `mode` key within
+/// it) is not an error -- it just means "use the default"
+/// (`ClientRoutingSettings::default`, i.e. `Disabled`).
+pub fn load_client_routing_settings(path: &str) -> Result<ClientRoutingSettings, ConfigError> {
+    let contents = fs::read_to_string(path)?;
+
+    let mode = match find_value(&contents, "routing", "mode") {
+        Some(value) => match value.as_str() {
+            "disabled" => RoutingMode::Disabled,
+            "split" => RoutingMode::Split,
+            "full" => RoutingMode::Full,
+            other => {
+                return Err(ConfigError::InvalidRoutingValue {
+                    key: "mode",
+                    found: other.to_string(),
+                })
+            }
+        },
+        None => ClientRoutingSettings::default().mode,
+    };
+
+    let routes = match find_value(&contents, "routing", "routes") {
+        Some(raw) => parse_route_list(&raw)?,
+        None => vec![],
+    };
+
+    Ok(ClientRoutingSettings { mode, routes })
+}
+
+/// Parse a `routes = ["a", "b"]`-style bracketed list into its elements
+/// (unquoted, trimmed). `find_value` already returns the bracketed
+/// substring unmodified for values shaped like this (its own
+/// quote-stripping only fires when the *whole* value starts with `"`,
+/// which `[...]` never does), so this just needs to peel the brackets and
+/// split on commas.
+fn parse_route_list(raw: &str) -> Result<Vec<String>, ConfigError> {
+    let inner = raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| ConfigError::InvalidRouteList {
+            found: raw.to_string(),
+        })?;
+
+    if inner.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    Ok(inner
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            item.strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(item)
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +404,84 @@ mod tests {
             Err(ConfigError::InvalidRoutingValue { key: "nat_enabled", .. }) => {}
             other => panic!("expected InvalidRoutingValue, got {other:?}"),
         }
+        let _ = fs::remove_file(path);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.8.5 client [routing] section tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn client_routing_settings_default_when_section_absent() {
+        let path = write_temp_config("[crypto]\nkey = \"deadbeef\"\n");
+        let settings = load_client_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings, ClientRoutingSettings::default());
+        assert_eq!(settings.mode, RoutingMode::Disabled);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_parses_split_mode_with_routes() {
+        let path = write_temp_config(
+            "[routing]\nmode = \"split\"\nroutes = [\"10.20.0.0/24\", \"10.30.0.0/16\"]\n",
+        );
+        let settings = load_client_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.mode, RoutingMode::Split);
+        assert_eq!(
+            settings.routes,
+            vec!["10.20.0.0/24".to_string(), "10.30.0.0/16".to_string()]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_parses_full_mode() {
+        let path = write_temp_config("[routing]\nmode = \"full\"\n");
+        let settings = load_client_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.mode, RoutingMode::Full);
+        assert!(settings.routes.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_invalid_mode_is_rejected() {
+        let path = write_temp_config("[routing]\nmode = \"turbo\"\n");
+        match load_client_routing_settings(path.to_str().unwrap()) {
+            Err(ConfigError::InvalidRoutingValue { key: "mode", .. }) => {}
+            other => panic!("expected InvalidRoutingValue, got {other:?}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_empty_route_list_parses_as_empty_vec() {
+        let path = write_temp_config("[routing]\nmode = \"split\"\nroutes = []\n");
+        let settings = load_client_routing_settings(path.to_str().unwrap()).unwrap();
+        assert!(settings.routes.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_malformed_route_list_is_rejected() {
+        let path = write_temp_config("[routing]\nmode = \"split\"\nroutes = \"not-a-list\"\n");
+        match load_client_routing_settings(path.to_str().unwrap()) {
+            Err(ConfigError::InvalidRouteList { .. }) => {}
+            other => panic!("expected InvalidRouteList, got {other:?}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_routing_settings_routes_ignored_in_full_mode_but_still_parsed() {
+        let path = write_temp_config(
+            "[routing]\nmode = \"full\"\nroutes = [\"10.20.0.0/24\"]\n",
+        );
+        let settings = load_client_routing_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.mode, RoutingMode::Full);
+        // Parsed regardless, even though Full mode's plan doesn't use it
+        // -- routing::build_client_routing_plan simply ignores `routes`
+        // for Full mode.
+        assert_eq!(settings.routes, vec!["10.20.0.0/24".to_string()]);
         let _ = fs::remove_file(path);
     }
 }

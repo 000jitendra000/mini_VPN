@@ -12,12 +12,72 @@ v0.5   Packet framing                           <- done
 v0.6   ChaCha20-Poly1305 encryption              <- done
 v0.6.5 Platform-independent TUN abstraction     <- done
 v0.7   PSK authentication + session establishment <- done
-v0.8   Routing + NAT (this version)             <- done
+v0.8   Linux server routing + NAT               <- done
+v0.8.5 Linux client routing (this version)      <- done
 v0.9   Android / Windows platform implementations
 v1.0   Tiny VPN
 ```
 
-## What v0.8 adds
+## What v0.8.5 adds
+
+v0.8 made the server a gateway; v0.8.5 makes the **client** actually route
+traffic into the tunnel, via `[routing]` in `config/client.toml`. Three
+modes, in increasing order of how much traffic gets pulled in:
+
+- **`disabled` (the default).** No client-side route changes at all --
+  installing v0.8.5 does not by itself change any existing client's
+  routing behavior. Only the VPN subnet (`10.13.13.0/24`, via the TUN
+  device's own automatic connected route) reaches the tunnel, exactly as
+  in v0.7/v0.8.
+- **`split`.** Route only the CIDRs listed in `routes = [...]` through
+  the VPN TUN device. Everything else -- including the default route --
+  is completely untouched.
+- **`full`.** Route *all* IPv4 traffic through the VPN TUN device, except
+  the VPN server's own endpoint, which is explicitly pinned to keep using
+  the client's normal pre-VPN route to it (see "The VPN server endpoint
+  exception" below) -- otherwise the tunnel would try to route its own
+  traffic through itself.
+
+Both `split` and `full` are tracked by an RAII guard
+(`routing::ClientRouteGuard`), the exact same pattern as the server's
+NAT/forwarding guard from v0.8: dropping it (on normal return, an error,
+or a caught `SIGINT`) removes exactly the routes that were added, in
+reverse order.
+
+## The VPN server endpoint exception
+
+This is the part that matters most for `full` mode. Before adding any VPN
+route, the client asks the OS how it currently reaches the VPN server
+(`ip route get <server-ip>`) and remembers that exact answer -- gateway
+and device, or just a device for a directly-connected/local address.
+That captured route becomes a `/32` host route pinned to the server's
+address, added as part of the *same* routing plan as the tunnel-wide
+routes, so the VPN server's own traffic can never be routed back into the
+tunnel that carries it (which would be a routing loop: TUN → encrypted
+packet destined for the server → routed back into TUN → ...).
+
+`full` mode does **not** touch, delete, or replace the literal
+`0.0.0.0/0` default route entry at all. Instead, it adds two
+more-specific routes -- `0.0.0.0/1` and `128.0.0.0/1` via the TUN device
+-- which together cover the entire IPv4 address space and win over the
+existing `/0` default route by longest-prefix match. This is the same
+technique established VPN clients use (OpenVPN's `redirect-gateway`,
+WireGuard's `wg-quick`) specifically because it needs no backup/restore
+logic for the original default route: removing the two `/1` routes on
+shutdown transparently and immediately restores the original
+default-route behavior, since it was never modified.
+
+**Simplifying assumption, documented as requested:** the VPN server
+address is resolved via the same DNS resolution `UdpSocket::connect`
+already performs, read back via `socket.peer_addr()`, so it reflects
+whatever the OS actually resolved and connected to (handling hostnames,
+non-default ports, etc. for free). Only IPv4 server endpoints are
+supported for client routing; if the resolved address is IPv6, `split`/
+`full` mode fail with a clear error rather than silently skipping route
+configuration or routing the wrong thing. IPv6 full-tunnel routing is not
+implemented and not claimed.
+
+## What v0.8 added (server-side; unchanged in v0.8.5)
 
 Through v0.7, tiny-vpn was a point-to-point encrypted tunnel: packets sent
 into the client's TUN interface arrived at the server's TUN interface,
@@ -51,12 +111,12 @@ backend.
 
 ## Required privileges
 
-Creating the TUN interface and configuring routing/NAT both need
-`CAP_NET_ADMIN` -- in practice, running as root (`sudo`) is the simplest
-way to get this. If `iptables` isn't installed, or the process isn't
-privileged enough, the server fails immediately with a clear error
-message (from the underlying `iptables`/`ip` command or a permission
-error) rather than silently doing nothing.
+Creating the TUN interface and configuring routing/NAT (server) or client
+routes (client) all need `CAP_NET_ADMIN` -- in practice, running as root
+(`sudo`) is the simplest way to get this on both sides. If `iptables`/`ip`
+isn't installed, or the process isn't privileged enough, the affected side
+fails immediately with a clear error message (from the underlying command
+or a permission error) rather than silently doing nothing.
 
 ## How forwarding/NAT works
 
@@ -94,8 +154,9 @@ which cannot be caught by any process, bypasses this entirely and *will*
 leave forwarding/NAT state behind; avoid it for anything but emergencies,
 and clean up manually (see "Manual cleanup" below) if it happens.
 
-The client performs no NAT and requires no special privileges beyond
-what earlier versions already needed (TUN creation).
+The client performs no NAT and needs no privileges beyond what earlier
+versions already needed (TUN creation), plus (as of v0.8.5, and only when
+`split`/`full` routing is enabled) the ability to add/remove routes.
 
 ## How to start the server
 
@@ -123,15 +184,64 @@ nat_enabled = false
 sudo ./target/debug/tiny-vpn udp-client <server-address>:9001
 ```
 
-The client's own TUN interface gets a connected route for
-`10.13.13.0/24` automatically (from the interface's address/netmask), so
-traffic addressed within that subnet reaches the tunnel with no extra
-configuration. **This is not yet a full default-route VPN**: the client
-does not redirect all of its Internet traffic through the tunnel, only
-traffic explicitly destined for the VPN subnet (or forced onto the TUN
-interface, e.g. with `ping -I tiny-tun-client <destination>` for
-testing). Routing *all* client traffic through the tunnel by default is
-future work, not yet implemented or claimed here.
+Optionally pass a config path (default `config/client.toml`):
+
+```bash
+sudo ./target/debug/tiny-vpn udp-client <server-address>:9001 path/to/client.toml
+```
+
+With `[routing] mode = "disabled"` (the default), the client's own TUN
+interface gets a connected route for `10.13.13.0/24` automatically, and
+that's the only route touching it -- no other traffic uses the tunnel.
+Set `mode = "split"` with a `routes = [...]` list, or `mode = "full"`, to
+route more; see "What v0.8.5 adds" above.
+
+## DNS limitation (full-tunnel mode)
+
+v0.8.5 does **not** implement DNS tunneling or DNS server reconfiguration.
+In `full` mode, all IPv4 *traffic* is routed through the tunnel, but DNS
+queries still go wherever the client's existing resolver configuration
+sends them (typically the physical network's DNS servers, outside the
+tunnel). This means:
+
+- DNS queries themselves are not encrypted or hidden by the VPN.
+- A network observer between the client and its DNS resolver can still
+  see which hostnames the client is looking up, even while `full` mode is
+  active.
+
+Do not treat `full` mode as hiding DNS activity. Fixing this (routing DNS
+through the tunnel, or reconfiguring the resolver) is explicitly out of
+scope for this milestone.
+
+## How to test split-tunnel routing
+
+```bash
+# config/client.toml: [routing] mode = "split", routes = ["203.0.113.0/24"]
+sudo ./target/debug/tiny-vpn udp-server 0.0.0.0:9001
+sudo ./target/debug/tiny-vpn udp-client 127.0.0.1:9001
+ip route show 203.0.113.0/24       # should show: ... dev tiny-tun-client
+ip route show default              # should be completely unchanged
+ping -c 3 203.0.113.5              # ordinary ping, no -I needed -- the
+                                    # route table itself sends it into the tunnel
+```
+
+## How to test full-tunnel routing (and the routing-loop check)
+
+```bash
+# config/client.toml: [routing] mode = "full"
+sudo ./target/debug/tiny-vpn udp-server 0.0.0.0:9001
+sudo ./target/debug/tiny-vpn udp-client <server-address>:9001
+
+# Mandatory check: the VPN server's own endpoint must still use its
+# original route, NOT the tunnel (otherwise: a routing loop).
+ip route get <server-address>
+
+# The literal default route entry must be untouched:
+ip route show default
+
+# But general traffic should now prefer the tunnel:
+ip route get 8.8.8.8               # should show: ... dev tiny-tun-client
+```
 
 ## How to test Internet connectivity
 
@@ -175,12 +285,16 @@ Every rule tiny-vpn adds carries `/* tiny-vpn */` as its comment.
 
 ## How cleanup works
 
-See "How forwarding/NAT works" above. In short: an RAII guard
-(`routing::RoutingGuard`) is held for as long as the session is active;
-dropping it (on normal return, an error, or a caught `SIGINT`) removes
-exactly the rules that guard's `apply()` call added and restores the
-forwarding sysctl to its prior value. Nothing is ever flushed wholesale,
-and nothing belonging to another application is touched.
+See "How forwarding/NAT works" above for the server side. In short: an
+RAII guard is held for as long as the session is active; dropping it (on
+normal return, an error, or a caught `SIGINT`) removes exactly what it
+added and restores whatever it changed to its prior value. Nothing is
+ever flushed wholesale, and nothing belonging to another application is
+touched. The client-side routing guard (`routing::ClientRouteGuard`,
+v0.8.5) works identically: it removes exactly the routes it added, in
+reverse order, on the same triggers (normal return, error, or `SIGINT` --
+the client now installs the same shutdown handler the server does, since
+it also has state to clean up).
 
 ### Manual cleanup
 
@@ -194,6 +308,24 @@ sudo iptables -D FORWARD -i <iface> -o tiny-tun-server -m state --state ESTABLIS
 echo 0 | sudo tee /proc/sys/net/ipv4/ip_forward   # only if it wasn't enabled before you started the server
 ```
 
+If a **client** process is killed with `SIGKILL` while `split`/`full`
+routing was active, remove the leftover routes by hand. For `split`,
+remove each configured CIDR:
+
+```bash
+sudo ip route del <cidr> dev tiny-tun-client
+```
+
+For `full`, remove the two override routes and the server-endpoint
+exception (substitute the actual server IP, gateway, and device from
+whatever your setup used):
+
+```bash
+sudo ip route del 0.0.0.0/1 dev tiny-tun-client
+sudo ip route del 128.0.0.0/1 dev tiny-tun-client
+sudo ip route del <server-ip>/32 via <original-gateway> dev <original-device>
+```
+
 ## Current platform limitations
 
 - **Linux only.** No Windows (Wintun) or Android (`VpnService`) backend
@@ -203,8 +335,11 @@ echo 0 | sudo tee /proc/sys/net/ipv4/ip_forward   # only if it wasn't enabled be
 - **Single client only.** The server tracks exactly one session (in
   progress or established) at a time; a second client's handshake
   attempt is rejected while a session is already established.
-- **No default-route client VPN.** Only explicit VPN-subnet traffic is
-  routed through the tunnel; not a full "route everything" VPN client.
+- **No DNS routing.** See "DNS limitation" above -- `full` mode does not
+  hide DNS activity.
+- **IPv4 only for client routing.** An IPv6-resolved server endpoint
+  causes `split`/`full` mode to fail with a clear error rather than
+  silently misconfiguring routes.
 - **No persistent reconnect.** If the connection drops, both sides simply
   stop; there is no automatic retry (planned for v0.9).
 - Earlier, still-accurate limitations from v0.7 remain: no intra-session
@@ -221,7 +356,7 @@ tiny-vpn tun                                     # v0.2: standalone TUN packet d
 tiny-vpn vpn-server <address>                    # v0.3: TUN <-> TCP server
 tiny-vpn vpn-client <address>                    # v0.3: TUN <-> TCP client
 tiny-vpn udp-server <address> [config-path]      # v0.4-v0.8: encrypted, authenticated, gateway-capable TUN <-> UDP server
-tiny-vpn udp-client <address> [config-path]      # v0.4-v0.8: encrypted, authenticated TUN <-> UDP client
+tiny-vpn udp-client <address> [config-path]      # v0.4-v0.8.5: encrypted, authenticated, routing-capable TUN <-> UDP client
 ```
 
 See the module docs in `src/` for details on each mode.

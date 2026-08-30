@@ -3,18 +3,39 @@
 # [server] is a placeholder for a later version (persistent
 # reconnect/config, v0.9) -- not read by tiny-vpn yet.
 #
-# [crypto] is read by \`udp-client\`/\`udp-server\` starting at v0.6: it's
+# [crypto] is read by `udp-client`/`udp-server` starting at v0.6: it's
 # the pre-shared key used for ChaCha20-Poly1305 encryption. Both the
 # client and server config files must contain the SAME key, or decryption
 # will fail authentication on both sides.
 #
 # WARNING: this default key is committed to the repo purely so the v0.6
 # demo works out of the box. Never do this for a real deployment --
-# generate your own key (e.g. \`openssl rand -hex 32\`) and keep it out of
+# generate your own key (e.g. `openssl rand -hex 32`) and keep it out of
 # version control.
 
 [server]
 address = "127.0.0.1:8080"
 
 [crypto]
-key = "2e2be72ff8bfebda19ce83587584352b7e950ab323236f72e13ad9023a0711f6"
+key = "3f1f82e5f7f5a71180a8d9232ce1053a4fdb5b69c7723f84efe7ceb43d480d97"
+
+# [routing] controls client-side routing, added in v0.8.5. Defaults to
+# "disabled" if this section (or the "mode" key) is absent -- installing
+# v0.8.5 does NOT by itself change any existing client's routing behavior.
+#
+# mode = "disabled"  -- no route changes at all (default; matches v0.7/v0.8).
+# mode = "split"      -- route only the CIDRs listed in `routes` through
+#                        the VPN TUN device; everything else is unchanged.
+# mode = "full"       -- route ALL IPv4 traffic through the VPN TUN device,
+#                        except the VPN server's own endpoint, which
+#                        always keeps using this host's normal route to
+#                        it (otherwise the tunnel would try to route its
+#                        own traffic through itself). See README.md for
+#                        exactly how this is done safely/reversibly, and
+#                        for the DNS-leakage caveat that applies to full
+#                        mode.
+[routing]
+mode = "disabled"
+
+# Only used when mode = "split". Each entry is an IPv4 CIDR.
+routes = ["10.20.0.0/24"]
