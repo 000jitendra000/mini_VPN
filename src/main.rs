@@ -1,7 +1,7 @@
 use std::env;
 use std::process;
 
-use tinyvpn::{auth, client, config, crypto, protocol, routing, server, transport, tun};
+use tinyvpn::{auth, client, config, crypto, protocol, routing, server, transport, tun, dns};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -85,8 +85,21 @@ fn run_udp_client(program: &str, args: &[String], mode: &str) -> std::io::Result
     let config_path = optional_config_path(args, "config/client.toml");
     
     let psk = client::load_psk(&config_path)?;
-    let routing_settings = config::load_client_routing_settings(&config_path)
+    let mut routing_settings = config::load_client_routing_settings(&config_path)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let dns_settings = config::load_dns_settings(&config_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    // Application-level enforcement: If VPN DNS is enabled and we are in Split mode,
+    // the DNS servers MUST be actively routed through the VPN to be queryable securely.
+    if dns_settings.enabled && routing_settings.mode == config::RoutingMode::Split {
+        for ip in &dns_settings.servers {
+            let cidr = format!("{}/32", ip);
+            if !routing_settings.routes.contains(&cidr) {
+                routing_settings.routes.push(cidr);
+            }
+        }
+    }
 
     let auth_client = client::authenticate(&address, &psk)?;
     
@@ -100,6 +113,13 @@ fn run_udp_client(program: &str, args: &[String], mode: &str) -> std::io::Result
 
     let server_ip = auth_client.server_ip()?;
     let _routing_guard = client::configure_client_routing(&routing_settings, server_ip)?;
+
+    let dns_config = dns::DnsConfig {
+        enabled: dns_settings.enabled,
+        servers: dns_settings.servers,
+    };
+    
+    let _dns_guard = dns::apply(&dns_config, tun::CLIENT_TUN_NAME)?;
     
     auth_client.start_relay(tun_device)
 }

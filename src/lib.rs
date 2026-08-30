@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod routing;
 pub mod server;
 pub mod transport;
+pub mod dns;
 pub mod tun;
 
 #[cfg(target_os = "android")]

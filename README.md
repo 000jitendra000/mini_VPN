@@ -13,8 +13,8 @@ v0.6   ChaCha20-Poly1305 encryption              <- done
 v0.6.5 Platform-independent TUN abstraction     <- done
 v0.7   PSK authentication + session establishment <- done
 v0.8   Linux server routing + NAT               <- done
-v0.8.5 Linux client routing (this version)      <- done
-v0.9   Android / Windows platform implementations
+v0.8.5 Linux client routing                     <- done
+v0.9   DNS configuration / leak mitigation      <- done
 v1.0   Tiny VPN
 ```
 
@@ -196,22 +196,20 @@ that's the only route touching it -- no other traffic uses the tunnel.
 Set `mode = "split"` with a `routes = [...]` list, or `mode = "full"`, to
 route more; see "What v0.8.5 adds" above.
 
-## DNS limitation (full-tunnel mode)
+## DNS Configuration (v0.9)
 
-v0.8.5 does **not** implement DNS tunneling or DNS server reconfiguration.
-In `full` mode, all IPv4 *traffic* is routed through the tunnel, but DNS
-queries still go wherever the client's existing resolver configuration
-sends them (typically the physical network's DNS servers, outside the
-tunnel). This means:
+v0.9 introduces portable OS-level DNS integration configured via `[dns]` in `config/client.toml`. The VPN does **not** implement a DNS server internally but will natively instruct the OS to query specified resolvers routing them robustly inside the VPN interfaces.
 
-- DNS queries themselves are not encrypted or hidden by the VPN.
-- A network observer between the client and its DNS resolver can still
-  see which hostnames the client is looking up, even while `full` mode is
-  active.
+A basic setup:
+```toml
+[dns]
+enabled = true
+servers = ["1.1.1.1", "10.13.13.2"]
+```
+If disabled or absent, OS DNS configurations remain completely untouched natively as default.
 
-Do not treat `full` mode as hiding DNS activity. Fixing this (routing DNS
-through the tunnel, or reconfiguring the resolver) is explicitly out of
-scope for this milestone.
+**DNS Leak Limitations & Architecture**:
+The `tinyvpn` engine dynamically integrates with standard OS resolvers ensuring conventional DNS requests successfully route across encrypted sessions securely. However, applications manually embedding customized recurse/encryption strategies (e.g. DoT / DoH implemented statically inside Google Chrome / Firefox bypassing traditional OS paths mapping directly to 8.8.8.8:443) inherently evade `resolvectl` bindings unless explicitly neutered externally. Android and Windows architecture mappings safely compile native interfaces structurally but currently evaluate to explicitly `Unsupported` bounds effectively rejecting OS-level modifications safely natively while pending future milestone extensions. Linux explicitly drives `resolvectl` safely unbinding seamlessly via local `DnsGuard` structures immediately terminating mappings natively.
 
 ## How to test split-tunnel routing
 
@@ -335,8 +333,7 @@ sudo ip route del <server-ip>/32 via <original-gateway> dev <original-device>
 - **Single client only.** The server tracks exactly one session (in
   progress or established) at a time; a second client's handshake
   attempt is rejected while a session is already established.
-- **No DNS routing.** See "DNS limitation" above -- `full` mode does not
-  hide DNS activity.
+- **Android / Windows DNS Unimplemented.** `v0.9` correctly abstracts DNS behaviors for native stubs, protecting execution pathways effectively, acting as a clear placeholder natively. 
 - **IPv4 only for client routing.** An IPv6-resolved server endpoint
   causes `split`/`full` mode to fail with a clear error rather than
   silently misconfiguring routes.

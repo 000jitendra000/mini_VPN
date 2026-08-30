@@ -1,6 +1,6 @@
 [package]
 name = "tiny-vpn"
-version = "0.8.5"
+version = "0.9.0"
 # NOTE: the v0.8.5 spec asks to keep edition = "2024". This project has
 # been on edition 2021 since v0.2 (documented in every version's report
 # since then): this sandbox's rustc is 1.75.0, which cannot build edition

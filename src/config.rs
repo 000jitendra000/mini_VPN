@@ -34,6 +34,8 @@ pub enum ConfigError {
     /// A `[routing] routes` entry was present but not a `[...]`-bracketed
     /// list, e.g. `routes = ["10.20.0.0/24"]`.
     InvalidRouteList { found: String },
+    /// A `[dns]` value was present but invalid.
+    InvalidDnsValue { key: &'static str, found: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -50,6 +52,9 @@ impl fmt::Display for ConfigError {
                     f,
                     "[routing] 'routes' must be a bracketed list like [\"10.20.0.0/24\"], found: {found:?}"
                 )
+            }
+            ConfigError::InvalidDnsValue { key, found } => {
+                write!(f, "[dns] '{key}' has an invalid value: {found:?}")
             }
         }
     }
@@ -286,6 +291,70 @@ fn parse_route_list(raw: &str) -> Result<Vec<String>, ConfigError> {
         .collect())
 }
 
+// ============================================================================
+// v0.9 DNS settings loaded from config file `[dns]` section.
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsSettings {
+    pub enabled: bool,
+    pub servers: Vec<std::net::IpAddr>,
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        DnsSettings {
+            enabled: false,
+            servers: vec![],
+        }
+    }
+}
+
+pub fn load_dns_settings(path: &str) -> Result<DnsSettings, ConfigError> {
+    let contents = fs::read_to_string(path)?;
+
+    let enabled = match find_value(&contents, "dns", "enabled") {
+        Some(value) => match value.as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(ConfigError::InvalidDnsValue {
+                    key: "enabled",
+                    found: other.to_string(),
+                })
+            }
+        },
+        None => DnsSettings::default().enabled,
+    };
+
+    let servers = match find_value(&contents, "dns", "servers") {
+        Some(raw) => {
+            let list = parse_route_list(&raw)?;
+            let mut ips = Vec::new();
+            for s in list {
+                match s.parse::<std::net::IpAddr>() {
+                    Ok(ip) => {
+                        // Prevent duplicates easily
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                    Err(_) => {
+                        return Err(ConfigError::InvalidDnsValue {
+                            key: "servers",
+                            found: format!("Invalid IP address: {s}"),
+                        });
+                    }
+                }
+            }
+            ips
+        }
+        None => vec![],
+    };
+
+    Ok(DnsSettings { enabled, servers })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,8 +549,66 @@ mod tests {
         assert_eq!(settings.mode, RoutingMode::Full);
         // Parsed regardless, even though Full mode's plan doesn't use it
         // -- routing::build_client_routing_plan simply ignores `routes`
-        // for Full mode.
         assert_eq!(settings.routes, vec!["10.20.0.0/24".to_string()]);
+        let _ = fs::remove_file(path);
+    }
+    
+    // ------------------------------------------------------------------
+    // v0.9 DNS tests
+    // ------------------------------------------------------------------
+    #[test]
+    fn dns_settings_default_when_absent() {
+        let path = write_temp_config("[client]\n");
+        let settings = load_dns_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.enabled, false);
+        assert!(settings.servers.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dns_settings_enabled_one_server() {
+        let path = write_temp_config("[dns]\nenabled = true\nservers = [\"10.13.13.2\"]\n");
+        let settings = load_dns_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.enabled, true);
+        assert_eq!(settings.servers, vec!["10.13.13.2".parse::<std::net::IpAddr>().unwrap()]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dns_settings_enabled_multiple_servers_and_duplicates() {
+        let path = write_temp_config("[dns]\nenabled = true\nservers = [\"10.13.13.2\", \"1.1.1.1\", \"10.13.13.2\"]\n");
+        let settings = load_dns_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.enabled, true);
+        assert_eq!(settings.servers.len(), 2);
+        assert_eq!(settings.servers[0], "10.13.13.2".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(settings.servers[1], "1.1.1.1".parse::<std::net::IpAddr>().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dns_settings_invalid_ip() {
+        let path = write_temp_config("[dns]\nservers = [\"not.an.ip\"]\n");
+        match load_dns_settings(path.to_str().unwrap()) {
+            Err(ConfigError::InvalidDnsValue { key: "servers", .. }) => {}
+            other => panic!("expected InvalidDnsValue, got {other:?}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dns_settings_empty_list() {
+        let path = write_temp_config("[dns]\nenabled = true\nservers = []\n");
+        let settings = load_dns_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.enabled, true);
+        assert!(settings.servers.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dns_settings_ipv6_support() {
+        let path = write_temp_config("[dns]\nservers = [\"2606:4700:4700::1111\"]\n");
+        let settings = load_dns_settings(path.to_str().unwrap()).unwrap();
+        assert_eq!(settings.servers[0], "2606:4700:4700::1111".parse::<std::net::IpAddr>().unwrap());
         let _ = fs::remove_file(path);
     }
 }
