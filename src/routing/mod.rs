@@ -30,22 +30,57 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-use linux::Guard as PlatformGuard;
+use linux::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "windows")]
+use windows::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod unsupported;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+use unsupported::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn install_shutdown_handler() {
+    unsupported::install_shutdown_handler()
+}
+#[cfg(target_os = "windows")]
+pub fn install_shutdown_handler() {
+    windows::install_shutdown_handler()
+}
 #[cfg(target_os = "linux")]
-use linux::ClientRouteGuard as PlatformClientRouteGuard;
+pub fn install_shutdown_handler() {
+    linux::install_shutdown_handler()
+}
 
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn shutdown_requested() -> bool {
+    unsupported::shutdown_requested()
+}
+#[cfg(target_os = "windows")]
+pub fn shutdown_requested() -> bool {
+    windows::shutdown_requested()
+}
 #[cfg(target_os = "linux")]
-pub use linux::{current_route_to, install_shutdown_handler, shutdown_requested};
+pub fn shutdown_requested() -> bool {
+    linux::shutdown_requested()
+}
 
-#[cfg(not(target_os = "linux"))]
-compile_error!(
-    "tiny-vpn's routing/NAT gateway backend is currently implemented for \
-     Linux only (see src/routing/mod.rs and src/routing/linux.rs). Add a \
-     new module under src/routing/ that implements `apply` for this \
-     target and wire it into the #[cfg]s here, rather than compiling a \
-     fake/nonfunctional stub for this target."
-);
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
+    unsupported::current_route_to(endpoint)
+}
+#[cfg(target_os = "linux")]
+pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
+    linux::current_route_to(endpoint)
+}
+#[cfg(target_os = "windows")]
+pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
+    windows::current_route_to(endpoint)
+}
 
 use std::fmt;
 use std::io;
@@ -84,6 +119,18 @@ pub struct RoutingGuard {
 #[cfg(target_os = "linux")]
 pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
     let inner = linux::apply(config)?;
+    Ok(RoutingGuard { inner })
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
+    let inner = windows::apply(config)?;
+    Ok(RoutingGuard { inner })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
+    let inner = unsupported::apply(config)?;
     Ok(RoutingGuard { inner })
 }
 
@@ -292,6 +339,18 @@ pub struct ClientRouteGuard {
 #[cfg(target_os = "linux")]
 pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
     let inner = linux::apply_client_routes(plan)?;
+    Ok(ClientRouteGuard { inner })
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
+    let inner = windows::apply_client_routes(plan)?;
+    Ok(ClientRouteGuard { inner })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
+    let inner = unsupported::apply_client_routes(plan)?;
     Ok(ClientRouteGuard { inner })
 }
 

@@ -38,15 +38,17 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
 
-#[cfg(not(target_os = "linux"))]
-compile_error!(
-    "tiny-vpn's virtual network interface is currently implemented for \
-     Linux only (see src/tun/mod.rs and src/tun/linux.rs). Android \
-     (VpnService), Windows (Wintun), and macOS (utun) backends are \
-     planned -- add a new module under src/tun/ that produces a \
-     PacketDevice and wire it into the #[cfg]s in src/tun/mod.rs, rather \
-     than compiling a fake/nonfunctional stub for this target."
-);
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+#[cfg(target_os = "windows")]
+use windows::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod unsupported;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+use unsupported::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
 
 use std::io::{self, Read, Write};
 
@@ -123,19 +125,15 @@ impl PacketDevice {
     }
 }
 
-impl Read for PacketReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+impl PacketReader {
+    pub fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read_packet(buf)
     }
 }
 
-impl Write for PacketWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+impl PacketWriter {
+    pub fn write_packet(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_packet(buf)
     }
 }
 
@@ -152,6 +150,26 @@ pub fn create_device(
     Ok(PacketDevice { inner })
 }
 
+#[cfg(target_os = "windows")]
+pub fn create_device(
+    name: &str,
+    address: (u8, u8, u8, u8),
+    netmask: (u8, u8, u8, u8),
+) -> io::Result<PacketDevice> {
+    let inner = windows::create_raw_device(name, address, netmask)?;
+    Ok(PacketDevice { inner })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn create_device(
+    name: &str,
+    address: (u8, u8, u8, u8),
+    netmask: (u8, u8, u8, u8),
+) -> io::Result<PacketDevice> {
+    let inner = unsupported::create_raw_device(name, address, netmask)?;
+    Ok(PacketDevice { inner })
+}
+
 /// Standalone virtual-interface smoke test (the `tiny-vpn tun` command,
 /// unchanged since v0.2): creates one device and prints every packet read
 /// from it. This is a diagnostic tool for whichever backend is compiled
@@ -160,6 +178,12 @@ pub fn create_device(
 /// whatever this OS's virtual interface gives you".
 #[cfg(target_os = "linux")]
 pub use linux::run;
+
+#[cfg(target_os = "windows")]
+pub use windows::run;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub use unsupported::run;
 
 /// Relay raw packets from a device reader out to `sink`, one device read
 /// per write, logging each one as `"{role}: TUN -> TCP: N bytes"`.
@@ -180,7 +204,7 @@ pub fn relay_tun_to_writer<W: Write>(
 ) -> io::Result<()> {
     let mut buf = [0u8; 4096];
     loop {
-        let n = tun_reader.read(&mut buf)?;
+        let n = tun_reader.read_packet(&mut buf)?;
         if n == 0 {
             continue;
         }
@@ -206,6 +230,6 @@ pub fn relay_reader_to_tun<R: Read>(
             return Ok(());
         }
         println!("{role}: TCP -> TUN: {n} bytes");
-        tun_writer.write_all(&buf[..n])?;
+        tun_writer.write_packet(&buf[..n])?;
     }
 }

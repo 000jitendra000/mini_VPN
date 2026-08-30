@@ -12,13 +12,30 @@
 use std::io::{self, Read, Write};
 
 /// The `tun` crate's device/reader/writer types already have exactly the
-/// shape `super::PacketDevice`/`PacketReader`/`PacketWriter` want to wrap
-/// (an openable device that splits into a `Read` half and a `Write`
-/// half), so this backend is just type aliases rather than new wrapper
-/// structs.
-pub type Device = tun::Device;
-pub type Reader = tun::Reader;
-pub type Writer = tun::Writer;
+/// shape `super::PacketDevice`/`PacketReader`/`PacketWriter` want to wrap,
+/// but since we want to expose explicit packet-based methods, we wrap them.
+pub struct Device(tun::Device);
+pub struct Reader(tun::Reader);
+pub struct Writer(tun::Writer);
+
+impl Device {
+    pub fn split(self) -> (Reader, Writer) {
+        let (reader, writer) = self.0.split();
+        (Reader(reader), Writer(writer))
+    }
+}
+
+impl Reader {
+    pub fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Writer {
+    pub fn write_packet(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf)
+    }
+}
 
 /// Name requested for the standalone `tiny-vpn tun` (v0.2) test interface.
 const TEST_TUN_NAME: &str = "tiny-tun0";
@@ -41,7 +58,7 @@ pub fn create_raw_device(
         platform_config.ensure_root_privileges(true);
     });
 
-    tun::create(&config).map_err(to_tun_error).map_err(io::Error::from)
+    tun::create(&config).map_err(to_tun_error).map_err(io::Error::from).map(Device)
 }
 
 /// Create a TUN interface and print info about every packet read from it.
@@ -56,7 +73,8 @@ pub fn create_raw_device(
 pub fn run() -> io::Result<()> {
     let echo_back = std::env::var("TINY_VPN_TUN_ECHO").as_deref() == Ok("1");
 
-    let mut dev = create_raw_device(TEST_TUN_NAME, TEST_TUN_ADDRESS, TEST_TUN_NETMASK)?;
+    let dev = create_raw_device(TEST_TUN_NAME, TEST_TUN_ADDRESS, TEST_TUN_NETMASK)?;
+    let (mut reader, mut writer) = dev.split();
 
     let (a, b, c, d) = TEST_TUN_ADDRESS;
     println!("TUN interface '{TEST_TUN_NAME}' is up at {a}.{b}.{c}.{d}/24");
@@ -67,11 +85,11 @@ pub fn run() -> io::Result<()> {
 
     let mut buf = [0u8; 4096];
     loop {
-        let n = dev.read(&mut buf)?;
+        let n = reader.read_packet(&mut buf)?;
         print_packet(&buf[..n]);
 
         if echo_back {
-            dev.write_all(&buf[..n])?;
+            writer.write_packet(&buf[..n])?;
         }
     }
 }

@@ -11,7 +11,6 @@ version = "0.8.5"
 edition = "2024"
 
 [dependencies]
-tun = "=0.7.5"
 chacha20poly1305 = "0.10"
 # Pinned: chacha20poly1305's default dependency chain otherwise pulls in a
 # zeroize version that requires Rust edition2024 (rustc 1.85+), which this
@@ -28,9 +27,16 @@ sha2 = "0.10"
 # poly1305/universal-hash chain); declared directly here because our own
 # code now uses it too.
 subtle = "2.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun = "=0.7.5"
 # v0.8: was already a transitive dependency (the `tun` crate's Linux
 # backend uses it for ioctl calls). Declared directly here because
 # `src/routing/linux.rs` now also uses it, for a minimal SIGINT handler
 # that lets the server's RAII routing/NAT cleanup run on Ctrl+C instead
 # of the process just dying mid-configuration (see routing/linux.rs).
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52.0", features = ["Win32_Foundation", "Win32_System_Console"] }
+wintun = "0.5.1"

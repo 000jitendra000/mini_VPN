@@ -50,7 +50,7 @@ use crate::tun;
 /// Load and parse the pre-shared key from `config_path`. Wraps config/key
 /// errors as `io::Error` so callers can use `?` alongside the rest of
 /// this module's I/O.
-fn load_psk(config_path: &str) -> io::Result<[u8; crypto::KEY_SIZE]> {
+pub fn load_psk(config_path: &str) -> io::Result<[u8; crypto::KEY_SIZE]> {
     let key_hex = config::load_crypto_key_hex(config_path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     crypto::parse_key_hex(&key_hex).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -151,42 +151,118 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
 /// The TUN interface and the TUN->UDP upload thread are created only
 /// once `handle_incoming_datagram` reports `ServerAction::EstablishSession`
 /// -- see `run_server_receive_loop`.
-pub fn run_udp_vpn(bind_address: &str, config_path: &str) -> io::Result<()> {
-    let psk = load_psk(config_path)?;
-    let routing_settings = config::load_routing_settings(config_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+pub struct AuthenticatedServer {
+    socket: UdpSocket,
+    session: ServerSession,
+    peer: SocketAddr,
+    established_peer_and_rx_cipher: Option<(SocketAddr, Arc<Cipher>)>,
+    psk: [u8; crypto::KEY_SIZE],
+}
 
+pub fn wait_for_client_and_authenticate(
+    bind_address: &str,
+    psk: [u8; crypto::KEY_SIZE],
+) -> io::Result<AuthenticatedServer> {
     // Safe to install unconditionally: this only affects process signal
     // handling (letting a blocking recv return with Interrupted on
-    // Ctrl+C so our RAII cleanup runs), not any networking state, and is
-    // just as valid when routing/NAT is disabled (nothing to clean up
-    // beyond the TUN device, which the OS removes on process exit
-    // regardless).
+    // Ctrl+C so our RAII cleanup runs).
     routing::install_shutdown_handler();
 
     let socket = UdpSocket::bind(bind_address)?;
     println!("VPN UDP server listening on {bind_address}");
 
-    if routing_settings.nat_enabled {
-        println!(
-            "Server: routing/NAT will be configured once a session is established \
-             (outbound interface: {})",
-            routing_settings
-                .outbound_interface
-                .as_deref()
-                .unwrap_or("auto-detect")
-        );
-    } else {
-        println!("Server: routing/NAT is disabled (tunnel-only mode; no Internet access via this server)");
+    let mut session = ServerSession::NoSession;
+    let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
+    
+    loop {
+        let (n, sender) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
+                println!("Server: shutdown requested during authentication");
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown requested"));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+
+        let action = handle_incoming_datagram(&mut session, sender, &buf[..n], &psk);
+
+        match action {
+            ServerAction::Reply(addr, bytes) => {
+                socket.send_to(&bytes, addr)?;
+            }
+            ServerAction::EstablishSession(peer, server_to_client) => {
+                return Ok(AuthenticatedServer {
+                    socket,
+                    session,
+                    peer,
+                    established_peer_and_rx_cipher: Some((peer, server_to_client)),
+                    psk,
+                });
+            }
+            ServerAction::WriteToTun(_) => unreachable!(),
+            ServerAction::Drop => {}
+        }
     }
+}
 
-    // Shared with the upload thread once it exists: the currently
-    // established (peer, send cipher). Created up front (empty) since
-    // `run_server_receive_loop` needs somewhere to put it once a session
-    // is established; the upload thread itself isn't spawned until then.
-    let established: Arc<Mutex<transport::EstablishedPeer>> = Arc::new(Mutex::new(None));
+impl AuthenticatedServer {
+    pub fn start_relay(mut self, tun_device: tun::PacketDevice) -> io::Result<()> {
+        let established_val = self.established_peer_and_rx_cipher.take().unwrap();
+        let established = Arc::new(Mutex::new(Some(established_val)));
 
-    run_server_receive_loop(&socket, &established, &psk, &routing_settings)
+        let (tun_reader, mut tun_writer) = tun_device.split();
+
+        let upload_socket = self.socket.try_clone()?;
+        let upload_established = Arc::clone(&established);
+        let upload_thread = thread::spawn(move || {
+            transport::relay_tun_to_udp_established(
+                tun_reader,
+                &upload_socket,
+                "Server",
+                upload_established,
+                crypto::Direction::ServerToClient,
+            )
+        });
+
+        let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
+        let loop_result: io::Result<()> = (|| loop {
+            let (n, sender) = match self.socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
+                    println!("Server: shutdown requested, cleaning up");
+                    return Ok(());
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+
+            let action = handle_incoming_datagram(&mut self.session, sender, &buf[..n], &self.psk);
+
+            match action {
+                ServerAction::Reply(addr, bytes) => {
+                    self.socket.send_to(&bytes, addr)?;
+                }
+                ServerAction::EstablishSession(peer, server_to_client) => {
+                    *established.lock().unwrap() = Some((peer, server_to_client));
+                }
+                ServerAction::WriteToTun(payload) => tun_writer.write_packet(&payload)?,
+                ServerAction::Drop => {}
+            }
+        })();
+
+        if loop_result.is_ok() {
+            drop(upload_thread);
+        } else {
+            match upload_thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
+                Err(_) => eprintln!("Server TUN->UDP thread panicked"),
+            }
+        }
+
+        loop_result
+    }
 }
 
 /// The server's session state machine. Exactly one session (in progress
@@ -389,155 +465,7 @@ fn handle_incoming_datagram(
     }
 }
 
-/// The server's UDP receive loop: read a datagram, decide what to do via
-/// `handle_incoming_datagram`, then perform the resulting I/O.
-///
-/// The TUN interface, the TUN->UDP upload thread, and (if
-/// `routing_settings.nat_enabled`) the host's forwarding/NAT
-/// configuration do not exist until the handshake completes: this loop
-/// creates all three, right here, the first (and only, given the
-/// one-client-only policy) time `handle_incoming_datagram` returns
-/// `ServerAction::EstablishSession`. Before that point, only handshake
-/// messages are ever handled -- there is no TUN device, no upload
-/// thread, and no routing/NAT state yet to route data through.
-///
-/// A `SIGINT` (Ctrl+C) interrupts the blocking `recv_from` below with
-/// `io::ErrorKind::Interrupted` (see `routing::install_shutdown_handler`)
-/// rather than killing the process outright, so this function can notice
-/// it, return `Ok(())`, and let its local RAII guards (`routing_guard`,
-/// and the upload-thread join below) run their cleanup.
-fn run_server_receive_loop(
-    socket: &UdpSocket,
-    established: &Arc<Mutex<transport::EstablishedPeer>>,
-    psk: &[u8; crypto::KEY_SIZE],
-    routing_settings: &config::RoutingSettings,
-) -> io::Result<()> {
-    let mut session = ServerSession::NoSession;
-    let mut buf = [0u8; transport::UDP_RECV_BUFFER_SIZE];
 
-    // None of these exist until the handshake completes (see
-    // `ServerAction::EstablishSession` below). `routing_guard` is only
-    // ever set if `routing_settings.nat_enabled`; dropping it (when this
-    // function returns) restores the host's forwarding/NAT state.
-    let mut tun_writer: Option<tun::PacketWriter> = None;
-    let mut upload_thread: Option<thread::JoinHandle<io::Result<()>>> = None;
-    let mut routing_guard: Option<routing::RoutingGuard> = None;
-
-    let loop_result: io::Result<()> = (|| loop {
-        let (n, sender) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
-                println!("Server: shutdown requested, cleaning up");
-                return Ok(());
-            }
-            // A spurious/unrelated EINTR (not our shutdown signal): just
-            // retry the read instead of treating it as a hard error.
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let action = handle_incoming_datagram(&mut session, sender, &buf[..n], psk);
-
-        match action {
-            ServerAction::Reply(addr, bytes) => {
-                socket.send_to(&bytes, addr)?;
-            }
-            ServerAction::EstablishSession(peer, server_to_client) => {
-                *established.lock().unwrap() = Some((peer, server_to_client));
-
-                // Only now -- after the handshake has fully authenticated
-                // this peer -- do we create the TUN interface and start
-                // relaying. If TUN creation fails here, that failure
-                // propagates out of this loop exactly like any other I/O
-                // error below.
-                let tun_device = tun::create_device(
-                    tun::SERVER_TUN_NAME,
-                    tun::SERVER_TUN_ADDRESS,
-                    tun::VPN_TUN_NETMASK,
-                )?;
-                let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
-                println!(
-                    "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
-                    tun::SERVER_TUN_NAME
-                );
-
-                // Only now -- after the TUN interface exists -- do we
-                // configure the host as a gateway for the VPN subnet.
-                // Not enabling forwarding/NAT before the authenticated
-                // session exists (or before its TUN interface exists) is
-                // deliberate: there is nothing to forward or NAT for
-                // until this point anyway, and configuring it earlier
-                // would have no VPN-side counterpart to justify it.
-                if routing_settings.nat_enabled {
-                    let routing_config = routing::RoutingConfig {
-                        vpn_subnet: routing::cidr_from_address_and_netmask(
-                            tun::SERVER_TUN_ADDRESS,
-                            tun::VPN_TUN_NETMASK,
-                        ),
-                        tun_interface: tun::SERVER_TUN_NAME.to_string(),
-                        outbound_interface: routing_settings.outbound_interface.clone(),
-                    };
-                    routing_guard = Some(routing::apply(&routing_config)?);
-                }
-
-                let (tun_reader, writer) = tun_device.split();
-                tun_writer = Some(writer);
-
-                let upload_socket = socket.try_clone()?;
-                let upload_established = Arc::clone(established);
-                upload_thread = Some(thread::spawn(move || {
-                    transport::relay_tun_to_udp_established(
-                        tun_reader,
-                        &upload_socket,
-                        "Server",
-                        upload_established,
-                        crypto::Direction::ServerToClient,
-                    )
-                }));
-            }
-            ServerAction::WriteToTun(payload) => match &mut tun_writer {
-                Some(writer) => writer.write_all(&payload)?,
-                None => {
-                    // Should not happen: `handle_incoming_datagram` only
-                    // returns `WriteToTun` once `session` is
-                    // `Established`, which is only reached via the
-                    // `EstablishSession` arm above, which always creates
-                    // `tun_writer` before returning. Defensive-only.
-                    eprintln!("Server: dropping decrypted packet: TUN not ready yet");
-                }
-            },
-            ServerAction::Drop => {}
-        }
-    })();
-
-    if let Some(handle) = upload_thread {
-        if loop_result.is_ok() {
-            // Clean shutdown (the only way `loop_result` is `Ok(())` is
-            // via the SIGINT path above): deliberately do NOT block
-            // waiting for the upload thread here. A signal delivered to
-            // this process is handled by whichever thread the kernel
-            // picks -- not necessarily the upload thread, which is
-            // blocked in its own TUN read -- so `handle.join()` could
-            // hang indefinitely, and with it, the routing/NAT cleanup
-            // below that a hung shutdown would never reach. The process
-            // is about to exit right after this function returns; the OS
-            // reclaims the abandoned thread's TUN fd and UDP socket the
-            // same way it always has when this project's processes exit.
-            drop(handle);
-        } else {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("Server TUN->UDP error: {e}"),
-                Err(_) => eprintln!("Server TUN->UDP thread panicked"),
-            }
-        }
-    }
-
-    // `routing_guard` drops here (restoring forwarding/NAT state) as this
-    // function returns, whether `loop_result` is `Ok` or `Err`.
-    drop(routing_guard);
-
-    loop_result
-}
 
 #[cfg(test)]
 mod tests {

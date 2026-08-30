@@ -45,7 +45,7 @@
 //! forward secrecy beyond one session's lifetime -- see `crypto.rs` and
 //! the v0.7 final report for exactly what is and isn't guaranteed.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 
@@ -94,7 +94,7 @@ pub fn relay_tun_to_udp_session(
 ) -> io::Result<()> {
     let mut buf = [0u8; TUN_READ_BUFFER_SIZE];
     loop {
-        let n = tun_reader.read(&mut buf)?;
+        let n = tun_reader.read_packet(&mut buf)?;
         if n == 0 {
             continue;
         }
@@ -181,7 +181,7 @@ pub fn relay_udp_to_tun_session(
             }
         };
         println!("{role}: FRAME -> TUN: {} byte payload", frame.payload.len());
-        tun_writer.write_all(&frame.payload)?;
+        tun_writer.write_packet(&frame.payload)?;
     }
 }
 
@@ -204,7 +204,7 @@ pub fn relay_tun_to_udp_established(
 ) -> io::Result<()> {
     let mut buf = [0u8; TUN_READ_BUFFER_SIZE];
     loop {
-        let n = tun_reader.read(&mut buf)?;
+        let n = tun_reader.read_packet(&mut buf)?;
         if n == 0 {
             continue;
         }

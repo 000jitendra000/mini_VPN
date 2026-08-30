@@ -1,0 +1,300 @@
+    Checking tiny-vpn v0.8.5 (/home/ronanki_jitendra/rust/tiny-vpn)
+error[E0425]: cannot find function `install_shutdown_handler` in module `routing`
+   --> src/client.rs:271:14
+    |
+271 | ...g::install_shutdown_handler();
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:42:8
+    |
+ 41 | #[cfg(not(target_os = "linux"))]
+    |          --------------------- the item is gated here
+ 42 | pub fn install_shutdown_handler() {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::install_shutdown_handler` exists but is inaccessible
+   --> src/routing/linux.rs:301:1
+    |
+301 | pub fn install_shutdown_handler() {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `shutdown_requested` in module `routing`
+   --> src/client.rs:324:74
+    |
+324 | ...ing::shutdown_requested() => {
+    |         ^^^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:47:8
+    |
+ 46 | ...g(not(target_os = "linux"))]
+    |         --------------------- the item is gated here
+ 47 | ...fn shutdown_requested() -> bool {
+    |       ^^^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::shutdown_requested` exists but is inaccessible
+   --> src/routing/linux.rs:313:1
+    |
+313 | pub fn shutdown_requested() -> bool {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `current_route_to` in module `routing`
+   --> src/client.rs:383:33
+    |
+383 | ...ing::current_route_to(&server_...
+    |         ^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:52:8
+    |
+ 51 | ...g(not(target_os = "linux"))]
+    |         --------------------- the item is gated here
+ 52 | ...fn current_route_to(endpoint: ...
+    |       ^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::current_route_to` exists but is inaccessible
+   --> src/routing/linux.rs:424:1
+    |
+424 | pub fn current_route_to(ip: &str) -> io::Result<super::RouteVia> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find type `PlatformClientRouteGuard` in this scope
+   --> src/routing/mod.rs:298:12
+    |
+298 |     inner: PlatformClientRouteGuard,
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `install_shutdown_handler` in module `routing`
+   --> src/server.rs:169:14
+    |
+169 | ...g::install_shutdown_handler();
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:42:8
+    |
+ 41 | #[cfg(not(target_os = "linux"))]
+    |          --------------------- the item is gated here
+ 42 | pub fn install_shutdown_handler() {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::install_shutdown_handler` exists but is inaccessible
+   --> src/routing/linux.rs:301:1
+    |
+301 | pub fn install_shutdown_handler() {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `shutdown_requested` in module `routing`
+   --> src/server.rs:180:74
+    |
+180 | ...ing::shutdown_requested() => {
+    |         ^^^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:47:8
+    |
+ 46 | ...g(not(target_os = "linux"))]
+    |         --------------------- the item is gated here
+ 47 | ...fn shutdown_requested() -> bool {
+    |       ^^^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::shutdown_requested` exists but is inaccessible
+   --> src/routing/linux.rs:313:1
+    |
+313 | pub fn shutdown_requested() -> bool {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0425]: cannot find function `shutdown_requested` in module `routing`
+   --> src/server.rs:232:78
+    |
+232 | ...ing::shutdown_requested() => {
+    |         ^^^^^^^^^^^^^^^^^^ not found in `routing`
+    |
+note: found an item that was configured out
+   --> src/routing/mod.rs:47:8
+    |
+ 46 | ...g(not(target_os = "linux"))]
+    |         --------------------- the item is gated here
+ 47 | ...fn shutdown_requested() -> bool {
+    |       ^^^^^^^^^^^^^^^^^^
+note: function `crate::routing::linux::shutdown_requested` exists but is inaccessible
+   --> src/routing/linux.rs:313:1
+    |
+313 | pub fn shutdown_requested() -> bool {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:42:53
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+42 |             let psk = server::load_psk(&config_path)?;
+   |                                                     ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:44:92
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+44 |                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+   |                                                                                            ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:46:86
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+46 |             let auth_server = server::wait_for_client_and_authenticate(&address, psk)?;
+   |                                                                                      ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:52:14
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+52 |             )?;
+   |              ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:66:70
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+66 |                 _routing_guard = Some(routing::apply(&routing_config)?);
+   |                                                                      ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:77:53
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+77 |             let psk = client::load_psk(&config_path)?;
+   |                                                     ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:79:92
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+79 |                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+   |                                                                                            ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:81:67
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+81 |             let auth_client = client::authenticate(&address, &psk)?;
+   |                                                                   ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:87:14
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+87 |             )?;
+   |              ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:91:52
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+91 |             let server_ip = auth_client.server_ip()?;
+   |                                                    ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+error[E0277]: the `?` operator can only be used in a function that returns `Result` or `Option` (or another type that implements `FromResidual`)
+  --> src/main.rs:92:96
+   |
+14 | fn main() {
+   | --------- this function should return `Result` or `Option` to accept `?`
+...
+92 |             let _routing_guard = client::configure_client_routing(&routing_settings, server_ip)?;
+   |                                                                                                ^ cannot use the `?` operator in a function that returns `()`
+   |
+   = note: the full name for the type has been written to '/home/ronanki_jitendra/rust/tiny-vpn/target/debug/deps/tiny_vpn-a5cd2a6a0ab4caa5.long-type-5085114458314011763.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+help: consider adding return type
+   |
+14 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+   |           +++++++++++++++++++++++++++++++++++++++++
+
+Some errors have detailed explanations: E0277, E0425.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `tiny-vpn` (bin "tiny-vpn") due to 18 previous errors

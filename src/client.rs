@@ -44,7 +44,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Load and parse the pre-shared key from `config_path`. Wraps config/key
 /// errors as `io::Error` so callers can use `?` alongside the rest of
 /// this module's I/O.
-fn load_psk(config_path: &str) -> io::Result<[u8; crypto::KEY_SIZE]> {
+pub fn load_psk(config_path: &str) -> io::Result<[u8; crypto::KEY_SIZE]> {
     let key_hex = config::load_crypto_key_hex(config_path)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     crypto::parse_key_hex(&key_hex).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -258,17 +258,16 @@ fn perform_handshake(socket: &UdpSocket, psk: &[u8; crypto::KEY_SIZE]) -> io::Re
 /// A VPN data packet that fails authentication (which should only happen
 /// under corruption, since the session key is by now confirmed correct)
 /// is dropped and logged -- never written to TUN.
-pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
-    let psk = load_psk(config_path)?;
-    let client_routing_settings = config::load_client_routing_settings(config_path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+pub struct AuthenticatedClient {
+    socket: UdpSocket,
+    session_ciphers: SessionCiphers,
+}
 
+pub fn authenticate(server_address: &str, psk: &[u8; crypto::KEY_SIZE]) -> io::Result<AuthenticatedClient> {
     // Reuses the exact same SIGINT handler/flag the v0.8 server installs
     // (see routing::install_shutdown_handler) rather than duplicating it:
     // a plain Ctrl+C would otherwise terminate this process immediately,
-    // skipping `routing_guard`'s cleanup below and leaving client routes
-    // behind. Safe to call unconditionally, including when routing is
-    // disabled -- it only affects process signal handling.
+    // skipping cleanup.
     routing::install_shutdown_handler();
 
     // Bind to an OS-assigned local port; we only ever talk to one server.
@@ -279,96 +278,71 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
         socket.local_addr()?
     );
 
-    let session_ciphers = perform_handshake(&socket, &psk)?;
-    let client_to_server = session_ciphers.client_to_server;
-    let server_to_client = session_ciphers.server_to_client;
+    let session_ciphers = perform_handshake(&socket, psk)?;
+    Ok(AuthenticatedClient { socket, session_ciphers })
+}
 
-    // Only now -- after the handshake has authenticated the server and
-    // fresh session keys exist -- do we create the TUN interface. If
-    // `perform_handshake` above returned an error, we never reach this
-    // point: no TUN is created and no relay thread starts.
-    let tun_device = tun::create_device(
-        tun::CLIENT_TUN_NAME,
-        tun::CLIENT_TUN_ADDRESS,
-        tun::VPN_TUN_NETMASK,
-    )?;
-    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
-    println!(
-        "Client TUN '{}' is up at {a}.{b}.{c}.{d}/24",
-        tun::CLIENT_TUN_NAME
-    );
-
-    // Only now -- after the TUN interface exists, and still before any
-    // VPN packet relaying begins -- do we optionally configure client
-    // routing. `socket` is already connected and the handshake already
-    // completed, so changing the routing table here cannot interfere
-    // with either.
-    let routing_guard = configure_client_routing(&client_routing_settings, &socket)?;
-
-    let (tun_reader, tun_writer) = tun_device.split();
-    let upload_socket = socket.try_clone()?;
-
-    // Thread: TUN -> UDP (packets captured from the local TUN device are
-    // framed, encrypted with this session's client-to-server key, and
-    // sent to the server).
-    let upload_thread = thread::spawn(move || {
-        transport::relay_tun_to_udp_session(
-            tun_reader,
-            &upload_socket,
-            "Client",
-            &client_to_server,
-            crypto::Direction::ClientToServer,
-        )
-    });
-
-    // Main thread: UDP -> TUN (datagrams arriving from the server are
-    // decrypted with this session's server-to-client key, authenticated,
-    // and written into the local TUN device).
-    let download_result = transport::relay_udp_to_tun_session(
-        &socket,
-        tun_writer,
-        "Client",
-        &server_to_client,
-        crypto::Direction::ServerToClient,
-    );
-
-    // A SIGINT-interrupted read is a clean shutdown request, not an
-    // error -- see `routing::install_shutdown_handler`.
-    let download_result = match download_result {
-        Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
-            println!("Client: shutdown requested, cleaning up");
-            Ok(())
-        }
-        other => other,
-    };
-
-    match &download_result {
-        Ok(()) => {
-            // Clean shutdown: deliberately do NOT block waiting for the
-            // upload thread here. A signal delivered to this process is
-            // handled by whichever thread the kernel picks -- not
-            // necessarily the upload thread, which is blocked in its own
-            // TUN read -- so `.join()` could hang indefinitely, and with
-            // it, the routing cleanup below that a hung shutdown would
-            // never reach (see the identical v0.8 server-side fix). The
-            // process is about to exit right after this function
-            // returns; the OS reclaims the abandoned thread's TUN fd and
-            // UDP socket the same way it always has.
-            drop(upload_thread);
-        }
-        Err(_) => match upload_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("Client TUN->UDP error: {e}"),
-            Err(_) => eprintln!("Client TUN->UDP thread panicked"),
-        },
+impl AuthenticatedClient {
+    pub fn server_ip(&self) -> io::Result<IpAddr> {
+        Ok(self.socket.peer_addr()?.ip())
     }
 
-    // `routing_guard` drops here (removing any client routes it added)
-    // as this function returns, whether `download_result` is `Ok` or
-    // `Err`.
-    drop(routing_guard);
+    pub fn start_relay(self, tun_device: tun::PacketDevice) -> io::Result<()> {
+        let client_to_server = self.session_ciphers.client_to_server;
+        let server_to_client = self.session_ciphers.server_to_client;
 
-    download_result
+        let (tun_reader, tun_writer) = tun_device.split();
+        let upload_socket = self.socket.try_clone()?;
+
+        // Thread: TUN -> UDP (packets captured from the local TUN device are
+        // framed, encrypted with this session's client-to-server key, and
+        // sent to the server).
+        let upload_thread = thread::spawn(move || {
+            transport::relay_tun_to_udp_session(
+                tun_reader,
+                &upload_socket,
+                "Client",
+                &client_to_server,
+                crypto::Direction::ClientToServer,
+            )
+        });
+
+        // Main thread: UDP -> TUN (datagrams arriving from the server are
+        // decrypted with this session's server-to-client key, authenticated,
+        // and written into the local TUN device).
+        let download_result = transport::relay_udp_to_tun_session(
+            &self.socket,
+            tun_writer,
+            "Client",
+            &server_to_client,
+            crypto::Direction::ServerToClient,
+        );
+
+        // A SIGINT-interrupted read is a clean shutdown request, not an
+        // error -- see `routing::install_shutdown_handler`.
+        let download_result = match download_result {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
+                println!("Client: shutdown requested, cleaning up");
+                Ok(())
+            }
+            other => other,
+        };
+
+        match &download_result {
+            Ok(()) => {
+                // Clean shutdown: deliberately do NOT block waiting for the
+                // upload thread here.
+                drop(upload_thread);
+            }
+            Err(_) => match upload_thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("Client TUN->UDP error: {e}"),
+                Err(_) => eprintln!("Client TUN->UDP thread panicked"),
+            },
+        }
+
+        download_result
+    }
 }
 
 /// Configure client-side routing per `settings`, if enabled. Returns
@@ -383,15 +357,15 @@ pub fn run_udp_vpn(server_address: &str, config_path: &str) -> io::Result<()> {
 /// IPv4 is the only supported case for the VPN server's endpoint in this
 /// milestone: if it resolved to IPv6, this returns an error rather than
 /// silently skipping route configuration or routing the wrong thing.
-fn configure_client_routing(
+pub fn configure_client_routing(
     settings: &config::ClientRoutingSettings,
-    socket: &UdpSocket,
+    server_ip: IpAddr,
 ) -> io::Result<Option<routing::ClientRouteGuard>> {
     if settings.mode == RoutingMode::Disabled {
         return Ok(None);
     }
 
-    let server_ip = match socket.peer_addr()?.ip() {
+    let server_ip = match server_ip {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => {
             return Err(io::Error::new(

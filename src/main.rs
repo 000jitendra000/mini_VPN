@@ -35,16 +35,8 @@ fn main() {
         }
         "vpn-server" => server::run_vpn(&require_address(program, &args, mode)),
         "vpn-client" => client::run_vpn(&require_address(program, &args, mode)),
-        "udp-server" => {
-            let address = require_udp_address(program, &args, mode);
-            let config_path = optional_config_path(&args, "config/server.toml");
-            server::run_udp_vpn(&address, &config_path)
-        }
-        "udp-client" => {
-            let address = require_udp_address(program, &args, mode);
-            let config_path = optional_config_path(&args, "config/client.toml");
-            client::run_udp_vpn(&address, &config_path)
-        }
+        "udp-server" => run_udp_server(program, &args, mode),
+        "udp-client" => run_udp_client(program, &args, mode),
         other => {
             eprintln!(
                 "Unknown mode '{other}'. Expected 'server', 'client', 'tun', 'vpn-server', 'vpn-client', 'udp-server', or 'udp-client'."
@@ -58,6 +50,66 @@ fn main() {
         eprintln!("Error: {e}");
         process::exit(1);
     }
+}
+
+fn run_udp_server(program: &str, args: &[String], mode: &str) -> std::io::Result<()> {
+    let address = require_udp_address(program, args, mode);
+    let config_path = optional_config_path(args, "config/server.toml");
+    
+    let psk = server::load_psk(&config_path)?;
+    let routing_settings = config::load_routing_settings(&config_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let auth_server = server::wait_for_client_and_authenticate(&address, psk)?;
+    
+    let tun_device = tun::create_device(
+        tun::SERVER_TUN_NAME,
+        tun::SERVER_TUN_ADDRESS,
+        tun::VPN_TUN_NETMASK,
+    )?;
+    let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
+    println!("Server TUN '{}' is up at {a}.{b}.{c}.{d}/24", tun::SERVER_TUN_NAME);
+
+    let mut _routing_guard = None;
+    if routing_settings.nat_enabled {
+        let routing_config = routing::RoutingConfig {
+            vpn_subnet: routing::cidr_from_address_and_netmask(
+                tun::SERVER_TUN_ADDRESS,
+                tun::VPN_TUN_NETMASK,
+            ),
+            tun_interface: tun::SERVER_TUN_NAME.to_string(),
+            outbound_interface: routing_settings.outbound_interface.clone(),
+        };
+        _routing_guard = Some(routing::apply(&routing_config)?);
+    } else {
+        println!("Server: routing/NAT is disabled (tunnel-only mode; no Internet access via this server)");
+    }
+
+    auth_server.start_relay(tun_device)
+}
+
+fn run_udp_client(program: &str, args: &[String], mode: &str) -> std::io::Result<()> {
+    let address = require_udp_address(program, args, mode);
+    let config_path = optional_config_path(args, "config/client.toml");
+    
+    let psk = client::load_psk(&config_path)?;
+    let routing_settings = config::load_client_routing_settings(&config_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let auth_client = client::authenticate(&address, &psk)?;
+    
+    let tun_device = tun::create_device(
+        tun::CLIENT_TUN_NAME,
+        tun::CLIENT_TUN_ADDRESS,
+        tun::VPN_TUN_NETMASK,
+    )?;
+    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
+    println!("Client TUN '{}' is up at {a}.{b}.{c}.{d}/24", tun::CLIENT_TUN_NAME);
+
+    let server_ip = auth_client.server_ip()?;
+    let _routing_guard = client::configure_client_routing(&routing_settings, server_ip)?;
+    
+    auth_client.start_relay(tun_device)
 }
 
 /// Extract the `<address>` argument for `server`/`client` mode, or print
