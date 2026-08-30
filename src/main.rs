@@ -1,15 +1,7 @@
 use std::env;
 use std::process;
 
-mod auth;
-mod client;
-mod config;
-mod crypto;
-mod protocol;
-mod routing;
-mod server;
-mod transport;
-mod tun;
+use tinyvpn::{auth, client, config, crypto, protocol, routing, server, transport, tun};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

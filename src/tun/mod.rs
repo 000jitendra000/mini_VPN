@@ -44,10 +44,16 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 use windows::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "android")]
+pub mod android;
+
+#[cfg(target_os = "android")]
+use android::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 mod unsupported;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 use unsupported::{Device as PlatformDevice, Reader as PlatformReader, Writer as PlatformWriter};
 
 use std::io::{self, Read, Write};
@@ -160,7 +166,7 @@ pub fn create_device(
     Ok(PacketDevice { inner })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn create_device(
     name: &str,
     address: (u8, u8, u8, u8),
@@ -168,6 +174,24 @@ pub fn create_device(
 ) -> io::Result<PacketDevice> {
     let inner = unsupported::create_raw_device(name, address, netmask)?;
     Ok(PacketDevice { inner })
+}
+
+#[cfg(target_os = "android")]
+pub fn create_device(
+    _name: &str,
+    _address: (u8, u8, u8, u8),
+    _netmask: (u8, u8, u8, u8),
+) -> io::Result<PacketDevice> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Cannot create TUN device by name on Android; must receive VpnService file descriptor natively.",
+    ))
+}
+
+#[cfg(target_os = "android")]
+pub fn create_device_from_fd(fd: std::os::fd::RawFd) -> PacketDevice {
+    let inner = android::create_device_from_fd(fd);
+    PacketDevice { inner }
 }
 
 /// Standalone virtual-interface smoke test (the `tiny-vpn tun` command,
@@ -182,7 +206,10 @@ pub use linux::run;
 #[cfg(target_os = "windows")]
 pub use windows::run;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "android")]
+pub use android::run;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub use unsupported::run;
 
 /// Relay raw packets from a device reader out to `sink`, one device read

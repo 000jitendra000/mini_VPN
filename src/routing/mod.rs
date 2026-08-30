@@ -37,15 +37,24 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 use windows::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "android")]
+pub mod android;
+#[cfg(target_os = "android")]
+use android::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 mod unsupported;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 use unsupported::{Guard as PlatformGuard, ClientRouteGuard as PlatformClientRouteGuard};
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn install_shutdown_handler() {
     unsupported::install_shutdown_handler()
+}
+#[cfg(target_os = "android")]
+pub fn install_shutdown_handler() {
+    android::install_shutdown_handler()
 }
 #[cfg(target_os = "windows")]
 pub fn install_shutdown_handler() {
@@ -56,9 +65,13 @@ pub fn install_shutdown_handler() {
     linux::install_shutdown_handler()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn shutdown_requested() -> bool {
     unsupported::shutdown_requested()
+}
+#[cfg(target_os = "android")]
+pub fn shutdown_requested() -> bool {
+    android::shutdown_requested()
 }
 #[cfg(target_os = "windows")]
 pub fn shutdown_requested() -> bool {
@@ -69,9 +82,13 @@ pub fn shutdown_requested() -> bool {
     linux::shutdown_requested()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
     unsupported::current_route_to(endpoint)
+}
+#[cfg(target_os = "android")]
+pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
+    android::current_route_to(endpoint)
 }
 #[cfg(target_os = "linux")]
 pub fn current_route_to(endpoint: &str) -> io::Result<RouteVia> {
@@ -128,9 +145,15 @@ pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
     Ok(RoutingGuard { inner })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
     let inner = unsupported::apply(config)?;
+    Ok(RoutingGuard { inner })
+}
+
+#[cfg(target_os = "android")]
+pub fn apply(config: &RoutingConfig) -> io::Result<RoutingGuard> {
+    let inner = android::apply(config)?;
     Ok(RoutingGuard { inner })
 }
 
@@ -348,9 +371,15 @@ pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGu
     Ok(ClientRouteGuard { inner })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
 pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
     let inner = unsupported::apply_client_routes(plan)?;
+    Ok(ClientRouteGuard { inner })
+}
+
+#[cfg(target_os = "android")]
+pub fn apply_client_routes(plan: &ClientRoutingPlan) -> io::Result<ClientRouteGuard> {
+    let inner = android::apply_client_routes(plan)?;
     Ok(ClientRouteGuard { inner })
 }
 

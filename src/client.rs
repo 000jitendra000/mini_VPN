@@ -264,14 +264,18 @@ pub struct AuthenticatedClient {
 }
 
 pub fn authenticate(server_address: &str, psk: &[u8; crypto::KEY_SIZE]) -> io::Result<AuthenticatedClient> {
+    // Bind to an OS-assigned local port; we only ever talk to one server.
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    authenticate_with_socket(socket, server_address, psk)
+}
+
+pub fn authenticate_with_socket(socket: UdpSocket, server_address: &str, psk: &[u8; crypto::KEY_SIZE]) -> io::Result<AuthenticatedClient> {
     // Reuses the exact same SIGINT handler/flag the v0.8 server installs
     // (see routing::install_shutdown_handler) rather than duplicating it:
     // a plain Ctrl+C would otherwise terminate this process immediately,
     // skipping cleanup.
     routing::install_shutdown_handler();
 
-    // Bind to an OS-assigned local port; we only ever talk to one server.
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.connect(server_address)?;
     println!(
         "UDP socket bound to {} and connected to server at {server_address}",

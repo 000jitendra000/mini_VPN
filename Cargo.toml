@@ -10,6 +10,10 @@ version = "0.8.5"
 # original probing that established this constraint.
 edition = "2024"
 
+[lib]
+name = "tinyvpn"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 chacha20poly1305 = "0.10"
 # Pinned: chacha20poly1305's default dependency chain otherwise pulls in a
@@ -28,14 +32,14 @@ sha2 = "0.10"
 # code now uses it too.
 subtle = "2.6"
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tun = "=0.7.5"
-# v0.8: was already a transitive dependency (the `tun` crate's Linux
-# backend uses it for ioctl calls). Declared directly here because
-# `src/routing/linux.rs` now also uses it, for a minimal SIGINT handler
-# that lets the server's RAII routing/NAT cleanup run on Ctrl+C instead
-# of the process just dying mid-configuration (see routing/linux.rs).
-libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52.0", features = ["Win32_Foundation", "Win32_System_Console"] }
