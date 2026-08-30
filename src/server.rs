@@ -154,6 +154,7 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
 pub struct AuthenticatedServer {
     socket: UdpSocket,
     session: ServerSession,
+    #[allow(dead_code)] // Retained for logging/future multi-client tracking
     peer: SocketAddr,
     established_peer_and_rx_cipher: Option<(SocketAddr, Arc<Cipher>)>,
     psk: [u8; crypto::KEY_SIZE],

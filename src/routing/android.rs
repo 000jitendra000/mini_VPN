@@ -1,7 +1,5 @@
-use crate::config::ClientRoutingSettings;
 use crate::routing::{RoutingConfig};
 use std::io;
-use std::net::IpAddr;
 
 // On Android, routing is managed natively via Kotlin `Builder.addRoute()` before FD establishment.
 // The Rust side explicitly does NOT execute route side-effects.

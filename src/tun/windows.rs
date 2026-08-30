@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, Weak};
 use wintun::{Adapter, Session};
 
 pub struct Device {
+    #[allow(dead_code)] // Retained to keep the Wintun adapter alive
     adapter: Arc<Adapter>,
     session: Arc<Session>,
 }
