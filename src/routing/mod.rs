@@ -113,6 +113,8 @@ pub struct RoutingConfig {
     /// Outbound interface to forward/NAT through. `None` means
     /// "auto-detect from the host's default route".
     pub outbound_interface: Option<String>,
+    /// Address topology for VPN Tunnel Endpoints
+    pub address_plan: crate::tun::TunnelAddressPlan,
 }
 
 /// RAII handle for "forwarding/NAT is currently configured for this VPN

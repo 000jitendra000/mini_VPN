@@ -27,6 +27,23 @@ impl Device {
 
 impl Reader {
     pub fn read_packet(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = self.0.as_raw_fd();
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        let res = unsafe { libc::poll(&mut pfd, 1, 250) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        } else if res == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "timeout"));
+        } else if (pfd.revents & libc::POLLIN) == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "not ready"));
+        }
+
         self.0.read(buf)
     }
 }

@@ -36,6 +36,8 @@ pub enum ConfigError {
     InvalidRouteList { found: String },
     /// A `[dns]` value was present but invalid.
     InvalidDnsValue { key: &'static str, found: String },
+    /// A `[tunnel]` value was present but invalid.
+    InvalidTunnelValue { key: &'static str, found: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -55,6 +57,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::InvalidDnsValue { key, found } => {
                 write!(f, "[dns] '{key}' has an invalid value: {found:?}")
+            }
+            ConfigError::InvalidTunnelValue { key, found } => {
+                write!(f, "[tunnel] '{key}' has an invalid value: {found:?}")
             }
         }
     }
@@ -353,6 +358,49 @@ pub fn load_dns_settings(path: &str) -> Result<DnsSettings, ConfigError> {
     };
 
     Ok(DnsSettings { enabled, servers })
+}
+
+// ============================================================================
+// v0.9 (Stage 6.1) Tunnel topology settings loaded from config file `[tunnel]` section.
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Topology {
+    Default,
+    WindowsIcs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelSettings {
+    pub topology: Topology,
+}
+
+impl Default for TunnelSettings {
+    fn default() -> Self {
+        TunnelSettings {
+            topology: Topology::Default,
+        }
+    }
+}
+
+pub fn load_tunnel_settings(path: &str) -> Result<TunnelSettings, ConfigError> {
+    let contents = fs::read_to_string(path)?;
+
+    let topology = match find_value(&contents, "tunnel", "topology") {
+        Some(value) => match value.as_str() {
+            "default" => Topology::Default,
+            "windows-ics" => Topology::WindowsIcs,
+            other => {
+                return Err(ConfigError::InvalidTunnelValue {
+                    key: "topology",
+                    found: other.to_string(),
+                })
+            }
+        },
+        None => TunnelSettings::default().topology,
+    };
+
+    Ok(TunnelSettings { topology })
 }
 
 #[cfg(test)]

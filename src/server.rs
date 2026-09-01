@@ -106,12 +106,14 @@ pub fn run_vpn(address: &str) -> io::Result<()> {
     let (stream, peer) = listener.accept()?;
     println!("Client connected: {peer}");
 
+    // For the basic TCP v0.3 server, just default the topology
+    let address_plan = tun::TunnelAddressPlan::default_topology();
     let tun_device = tun::create_device(
         tun::SERVER_TUN_NAME,
-        tun::SERVER_TUN_ADDRESS,
+        address_plan.server_address,
         tun::VPN_TUN_NETMASK,
     )?;
-    let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
+    let (a, b, c, d) = address_plan.server_address;
     println!(
         "Server TUN '{}' is up at {a}.{b}.{c}.{d}/24",
         tun::SERVER_TUN_NAME
@@ -170,6 +172,7 @@ pub fn wait_for_client_and_authenticate(
     routing::install_shutdown_handler();
 
     let socket = UdpSocket::bind(bind_address)?;
+    socket.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
     println!("VPN UDP server listening on {bind_address}");
 
     let mut session = ServerSession::NoSession;
@@ -178,11 +181,13 @@ pub fn wait_for_client_and_authenticate(
     loop {
         let (n, sender) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
-                println!("Server: shutdown requested during authentication");
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown requested"));
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
+                if routing::shutdown_requested() {
+                    println!("Server: shutdown requested during authentication");
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown requested"));
+                }
+                continue;
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
 
@@ -230,11 +235,13 @@ impl AuthenticatedServer {
         let loop_result: io::Result<()> = (|| loop {
             let (n, sender) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted && routing::shutdown_requested() => {
-                    println!("Server: shutdown requested, cleaning up");
-                    return Ok(());
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
+                    if routing::shutdown_requested() {
+                        println!("Server: shutdown requested, cleaning up");
+                        return Ok(());
+                    }
+                    continue;
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
 

@@ -106,12 +106,14 @@ pub fn run(address: &str) -> io::Result<()> {
 /// See `tun::relay_tun_to_writer` / `tun::relay_reader_to_tun` for the
 /// important caveat that v0.3 does not yet frame packets on the wire.
 pub fn run_vpn(address: &str) -> io::Result<()> {
+    // For the basic TCP v0.3 client, just default the topology
+    let address_plan = tun::TunnelAddressPlan::default_topology();
     let tun_device = tun::create_device(
         tun::CLIENT_TUN_NAME,
-        tun::CLIENT_TUN_ADDRESS,
+        address_plan.client_address,
         tun::VPN_TUN_NETMASK,
     )?;
-    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
+    let (a, b, c, d) = address_plan.client_address;
     println!(
         "Client TUN '{}' is up at {a}.{b}.{c}.{d}/24",
         tun::CLIENT_TUN_NAME
@@ -230,8 +232,8 @@ fn perform_handshake(socket: &UdpSocket, psk: &[u8; crypto::KEY_SIZE]) -> io::Re
     socket.send(&protocol::HandshakeMessage::Confirm { tag: client_tag }.encode())?;
 
     // The handshake is done; the data-relay loops that follow should
-    // block indefinitely waiting for traffic, not time out.
-    socket.set_read_timeout(None)?;
+    // now use bounded waits so they can shut down gracefully.
+    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
 
     println!(
         "Client: session established (fingerprints c->s={} s->c={})",

@@ -94,7 +94,17 @@ pub fn relay_tun_to_udp_session(
 ) -> io::Result<()> {
     let mut buf = [0u8; TUN_READ_BUFFER_SIZE];
     loop {
-        let n = tun_reader.read_packet(&mut buf)?;
+        let n = match tun_reader.read_packet(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
+                if crate::routing::shutdown_requested() {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
         if n == 0 {
             continue;
         }
@@ -137,7 +147,17 @@ pub fn relay_udp_to_tun_session(
 ) -> io::Result<()> {
     let mut buf = [0u8; UDP_RECV_BUFFER_SIZE];
     loop {
-        let n = socket.recv(&mut buf)?;
+        let n = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
+                if crate::routing::shutdown_requested() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "shutdown requested"));
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
         if n == 0 {
             continue;
         }
@@ -204,7 +224,17 @@ pub fn relay_tun_to_udp_established(
 ) -> io::Result<()> {
     let mut buf = [0u8; TUN_READ_BUFFER_SIZE];
     loop {
-        let n = tun_reader.read_packet(&mut buf)?;
+        let n = match tun_reader.read_packet(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::Interrupted => {
+                if crate::routing::shutdown_requested() {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
         if n == 0 {
             continue;
         }

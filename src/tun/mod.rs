@@ -58,16 +58,43 @@ use unsupported::{Device as PlatformDevice, Reader as PlatformReader, Writer as 
 
 use std::io::{self, Read, Write};
 
-/// Name/address for the VPN client's TUN interface (used by `vpn-client`
+/// Name for the VPN client's TUN interface (used by `vpn-client`
 /// and `udp-client`). Not platform-specific -- this is this project's own
 /// test network layout, not an OS concept.
 pub const CLIENT_TUN_NAME: &str = "tiny-tun-client";
-pub const CLIENT_TUN_ADDRESS: (u8, u8, u8, u8) = (10, 13, 13, 1);
 
-/// Name/address for the VPN server's TUN interface (used by `vpn-server`
+/// Name for the VPN server's TUN interface (used by `vpn-server`
 /// and `udp-server`).
 pub const SERVER_TUN_NAME: &str = "tiny-tun-server";
-pub const SERVER_TUN_ADDRESS: (u8, u8, u8, u8) = (10, 13, 13, 2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelAddressPlan {
+    pub client_address: (u8, u8, u8, u8),
+    pub server_address: (u8, u8, u8, u8),
+}
+
+impl TunnelAddressPlan {
+    pub fn default_topology() -> Self {
+        Self {
+            client_address: (10, 13, 13, 1),
+            server_address: (10, 13, 13, 2),
+        }
+    }
+
+    pub fn windows_ics_topology() -> Self {
+        Self {
+            client_address: (10, 13, 13, 2),
+            server_address: (10, 13, 13, 1),
+        }
+    }
+    
+    pub fn from_topology(topology: &crate::config::Topology) -> Self {
+        match topology {
+            crate::config::Topology::Default => Self::default_topology(),
+            crate::config::Topology::WindowsIcs => Self::windows_ics_topology(),
+        }
+    }
+}
 
 /// Shared netmask for the client/server test network.
 pub const VPN_TUN_NETMASK: (u8, u8, u8, u8) = (255, 255, 255, 0);

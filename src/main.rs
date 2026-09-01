@@ -52,25 +52,30 @@ fn run_udp_server(program: &str, args: &[String], mode: &str) -> std::io::Result
     let routing_settings = config::load_routing_settings(&config_path)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
+    let tunnel_settings = config::load_tunnel_settings(&config_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let address_plan = tun::TunnelAddressPlan::from_topology(&tunnel_settings.topology);
+
     let auth_server = server::wait_for_client_and_authenticate(&address, psk)?;
     
     let tun_device = tun::create_device(
         tun::SERVER_TUN_NAME,
-        tun::SERVER_TUN_ADDRESS,
+        address_plan.server_address,
         tun::VPN_TUN_NETMASK,
     )?;
-    let (a, b, c, d) = tun::SERVER_TUN_ADDRESS;
+    let (a, b, c, d) = address_plan.server_address;
     println!("Server TUN '{}' is up at {a}.{b}.{c}.{d}/24", tun::SERVER_TUN_NAME);
 
     let mut _routing_guard = None;
     if routing_settings.nat_enabled {
         let routing_config = routing::RoutingConfig {
             vpn_subnet: routing::cidr_from_address_and_netmask(
-                tun::SERVER_TUN_ADDRESS,
+                address_plan.server_address,
                 tun::VPN_TUN_NETMASK,
             ),
             tun_interface: tun::SERVER_TUN_NAME.to_string(),
             outbound_interface: routing_settings.outbound_interface.clone(),
+            address_plan: address_plan.clone(),
         };
         _routing_guard = Some(routing::apply(&routing_config)?);
     } else {
@@ -101,14 +106,18 @@ fn run_udp_client(program: &str, args: &[String], mode: &str) -> std::io::Result
         }
     }
 
+    let tunnel_settings = config::load_tunnel_settings(&config_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let address_plan = tun::TunnelAddressPlan::from_topology(&tunnel_settings.topology);
+
     let auth_client = client::authenticate(&address, &psk)?;
     
     let tun_device = tun::create_device(
         tun::CLIENT_TUN_NAME,
-        tun::CLIENT_TUN_ADDRESS,
+        address_plan.client_address,
         tun::VPN_TUN_NETMASK,
     )?;
-    let (a, b, c, d) = tun::CLIENT_TUN_ADDRESS;
+    let (a, b, c, d) = address_plan.client_address;
     println!("Client TUN '{}' is up at {a}.{b}.{c}.{d}/24", tun::CLIENT_TUN_NAME);
 
     let server_ip = auth_client.server_ip()?;
